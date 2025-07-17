@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# process_task.py - 短影音處理核心引擎 (完整功能版)
+# process_task.py - 短影音處理核心引擎 (修正版)
 
 import os
 import sys
@@ -32,9 +32,9 @@ class VideoProcessor:
         """初始化處理器，從環境變數獲取配置"""
         # === API 與服務金鑰 ===
         self.r2_account_id = self._get_required_env('R2_ACCOUNT_ID')
-        self.r2_access_key = self._get_required_env('R2_ACCESS_KEY')
-        self.r2_secret_key = self._get_required_env('R2_SECRET_KEY')
-        self.r2_bucket = os.getenv('R2_BUCKET', 'video-automation')
+        self.r2_access_key = self._get_required_env('R2_ACCESS_KEY_ID')       # 支援您的變數命名
+        self.r2_secret_key = self._get_required_env('R2_SECRET_ACCESS_KEY')   # 支援您的變數命名
+        self.r2_bucket = os.getenv('R2_BUCKET_NAME', 'ai-video-storage')     # 支援您的變數命名
         self.openai_api_key = self._get_required_env('OPENAI_API_KEY')
         self.webhook_url = self._get_required_env('N8N_WEBHOOK_URL')
         self.webhook_secret = self._get_required_env('N8N_WEBHOOK_SECRET')
@@ -70,6 +70,7 @@ class VideoProcessor:
         
         logger.info(f"🎬 開始處理任務: {self.task_name} (ID: {self.task_id})")
         logger.info(f"📹 影片連結: {self.video_url}")
+        logger.info(f"🪣 R2 儲存桶: {self.r2_bucket}")
         
     def _get_required_env(self, key: str) -> str:
         """取得必要的環境變數，如果不存在則拋出異常"""
@@ -246,11 +247,13 @@ class VideoProcessor:
                 ContentType='application/json'
             )
             
-            # 生成公開 URL
-            custom_domain = os.getenv('R2_CUSTOM_DOMAIN')
-            if custom_domain:
-                base_url = f"https://{custom_domain}"
+            # ✅ 修正：生成公開 URL（支援您的變數命名）
+            public_url_base = os.getenv('R2_PUBLIC_URL_BASE')
+            if public_url_base:
+                # 移除尾部斜線，確保 URL 格式正確
+                base_url = public_url_base.rstrip('/')
             else:
+                # 使用預設的 R2 URL 格式
                 base_url = f"https://{self.r2_bucket}.{self.r2_account_id}.r2.cloudflarestorage.com"
                 
             self.video_url_r2 = f"{base_url}/{video_key}"
