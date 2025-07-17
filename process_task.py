@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# process_task.py - 短影音處理核心引擎 (修正版)
+# -*- coding: utf-8 -*-
+# process_task.py - 短影音處理核心引擎 (Windows 編碼修復版)
 
 import os
 import sys
@@ -15,51 +16,90 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any
+import openai
 
-# 設置日誌
+# 設置 UTF-8 編碼（Windows 修復）
+if sys.platform == 'win32':
+    import locale
+    try:
+        locale.setlocale(locale.LC_ALL, 'en_US.UTF-8')
+    except:
+        try:
+            locale.setlocale(locale.LC_ALL, 'C.UTF-8')
+        except:
+            pass
+
+# --- 日誌設定 (Windows 編碼修復) ---
+class SafeFormatter(logging.Formatter):
+    def format(self, record):
+        # 移除或替換 emoji 字符
+        msg = super().format(record)
+        emoji_map = {
+            '🎬': '[VIDEO]',
+            '📹': '[LINK]',
+            '🔽': '[DOWNLOAD]',
+            '✅': '[SUCCESS]',
+            '❌': '[ERROR]',
+            '⚠️': '[WARNING]',
+            '☁️': '[CLOUD]',
+            '🤖': '[AI]',
+            '📤': '[SEND]',
+            '🎉': '[COMPLETE]',
+            '⏱️': '[TIME]',
+            '🗑️': '[CLEANUP]',
+            '💥': '[FAILED]',
+            '📁': '[FOLDER]',
+            '📋': '[TASK]',
+            '🔒': '[SECURITY]'
+        }
+        
+        for emoji, replacement in emoji_map.items():
+            msg = msg.replace(emoji, replacement)
+            
+        return msg
+
+# 設置日誌處理器
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(SafeFormatter('%(asctime)s - %(levelname)s - %(message)s'))
+
+file_handler = logging.FileHandler("processing.log", encoding='utf-8')
+file_handler.setFormatter(SafeFormatter('%(asctime)s - %(levelname)s - %(message)s'))
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("processing.log"),
-        logging.StreamHandler()
-    ]
+    handlers=[file_handler, console_handler]
 )
 logger = logging.getLogger(__name__)
 
 class VideoProcessor:
     def __init__(self):
         """初始化處理器，從環境變數獲取配置"""
-        # === API 與服務金鑰 ===
+        # --- API 與服務金鑰 ---
         self.r2_account_id = self._get_required_env('R2_ACCOUNT_ID')
-        self.r2_access_key = self._get_required_env('R2_ACCESS_KEY_ID')       # 支援您的變數命名
-        self.r2_secret_key = self._get_required_env('R2_SECRET_ACCESS_KEY')   # 支援您的變數命名
-        self.r2_bucket = os.getenv('R2_BUCKET_NAME', 'ai-video-storage')     # 支援您的變數命名
+        self.r2_access_key = self._get_required_env('R2_ACCESS_KEY')
+        self.r2_secret_key = self._get_required_env('R2_SECRET_KEY')
+        self.r2_bucket = os.getenv('R2_BUCKET', 'video-automation')
         self.openai_api_key = self._get_required_env('OPENAI_API_KEY')
-        self.webhook_url = self._get_required_env('N8N_WEBHOOK_URL')
-        self.webhook_secret = self._get_required_env('N8N_WEBHOOK_SECRET')
+        
+        # Webhook URL 處理 - 支援測試模式
+        self.webhook_url = os.getenv('N8N_WEBHOOK_URL', '')
+        self.webhook_secret = os.getenv('N8N_WEBHOOK_SECRET', '')
+        self.test_mode = os.getenv('TEST_MODE', 'false').lower() == 'true'
 
-        # === 任務參數 ===
+        # --- 任務參數 ---
         self.video_url = self._get_required_env('VIDEO_URL')
         self.task_name = self._get_required_env('TASK_NAME')
         self.assignee = os.getenv('ASSIGNEE', '')
         self.photographer = os.getenv('PHOTOGRAPHER', '')
         self.shoot_date = os.getenv('SHOOT_DATE') or datetime.now().strftime('%Y-%m-%d')
         self.notes = os.getenv('NOTES', '')
-        self.row_index = self._get_required_env('GSHEET_ROW_INDEX')
+        self.row_index = os.getenv('GSHEET_ROW_INDEX', '1')
         
-        # === 生成任務 ID ===
+        # --- 生成任務 ID ---
         self.task_id = self._generate_task_id()
         
-        # === 初始化 OpenAI 客戶端 ===
-        try:
-            import openai
-            self.openai_client = openai.OpenAI(api_key=self.openai_api_key)
-        except ImportError:
-            logger.error("需要安裝 openai 套件: pip install openai")
-            sys.exit(1)
-        
-        # === 初始化 R2 客戶端 ===
+        # --- 初始化客戶端 ---
+        self.openai_client = openai.OpenAI(api_key=self.openai_api_key)
         self.r2_client = boto3.client(
             's3',
             endpoint_url=f'https://{self.r2_account_id}.r2.cloudflarestorage.com',
@@ -68,9 +108,9 @@ class VideoProcessor:
             region_name='auto'
         )
         
-        logger.info(f"🎬 開始處理任務: {self.task_name} (ID: {self.task_id})")
-        logger.info(f"📹 影片連結: {self.video_url}")
-        logger.info(f"🪣 R2 儲存桶: {self.r2_bucket}")
+        logger.info(f"[VIDEO] 開始處理任務: {self.task_name} (ID: {self.task_id})")
+        logger.info(f"[LINK] 影片連結: {self.video_url}")
+        logger.info(f"[TASK] 測試模式: {'開啟' if self.test_mode else '關閉'}")
         
     def _get_required_env(self, key: str) -> str:
         """取得必要的環境變數，如果不存在則拋出異常"""
@@ -87,14 +127,15 @@ class VideoProcessor:
     def _sanitize_filename(self, filename: str) -> str:
         """清理檔案名稱，移除不安全字符"""
         import re
+        # 移除或替換不安全字符
         safe_name = re.sub(r'[<>:"/\\|?*]', '_', filename)
-        safe_name = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', safe_name)
-        return safe_name[:100]
+        safe_name = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', safe_name)  # 移除控制字符
+        return safe_name[:100]  # 限制長度
         
     def create_temp_directory(self):
         """創建臨時工作目錄"""
         self.temp_dir = tempfile.mkdtemp(prefix=f'video_processor_{self.task_id}_')
-        logger.info(f"📁 創建臨時目錄: {self.temp_dir}")
+        logger.info(f"[FOLDER] 創建臨時目錄: {self.temp_dir}")
         return self.temp_dir
         
     def download_video(self) -> bool:
@@ -102,22 +143,22 @@ class VideoProcessor:
         try:
             safe_name = self._sanitize_filename(self.task_name)
             
-            # yt-dlp 指令
+            # 優化：指令確保影音合併，提高成功率
             cmd = [
                 'yt-dlp',
                 '--format', 'bestvideo[height<=720]+bestaudio/best[height<=720]',
                 '--merge-output-format', 'mp4',
                 '--write-thumbnail',
                 '--write-info-json',
-                '--no-playlist',
-                '--extractor-retries', '3',
+                '--no-playlist',  # 避免下載整個播放列表
+                '--extractor-retries', '3',  # 重試機制
                 '--output', f'{self.temp_dir}/{safe_name}.%(ext)s',
                 '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 self.video_url
             ]
             
-            logger.info(f"🔽 執行下載指令: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            logger.info(f"[DOWNLOAD] 執行下載指令: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)  # 10分鐘超時
             
             if result.returncode != 0:
                 logger.error(f"yt-dlp stderr: {result.stderr}")
@@ -127,21 +168,22 @@ class VideoProcessor:
             files = list(Path(self.temp_dir).glob('*'))
             logger.info(f"下載目錄包含檔案: {[f.name for f in files]}")
             
+            # 更精確的檔案匹配
             self.video_file = None
             self.thumbnail_file = None
             self.info_file = None
             
             for file in files:
-                if file.suffix.lower() in ['.mp4', '.webm', '.mkv'] and 'info' not in file.name.lower():
+                if file.suffix.lower() in ['.mp4', '.webm', '.mkv', '.mov'] and 'info' not in file.name.lower():
                     self.video_file = file
-                elif 'thumb' in file.name.lower() and file.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']:
+                elif any(x in file.name.lower() for x in ['thumb', 'thumbnail']) and file.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']:
                     self.thumbnail_file = file
                 elif file.suffix == '.json' and 'info' in file.name.lower():
                     self.info_file = file
 
             if not self.video_file:
-                raise Exception(f"找不到影片檔案。可用檔案: {[f.name for f in files]}")
-            
+                available_files = [f.name for f in files]
+                raise Exception(f"找不到影片檔案。可用檔案: {available_files}")
             if not self.thumbnail_file:
                 logger.warning("找不到縮圖檔案，將嘗試從影片生成")
                 self._generate_thumbnail_from_video()
@@ -158,19 +200,18 @@ class VideoProcessor:
                     'extractor': 'Unknown'
                 }
                 
-            logger.info("✅ 下載完成:")
+            logger.info("[SUCCESS] 下載完成:")
             logger.info(f"   影片: {self.video_file.name} ({self._get_file_size(self.video_file)})")
-            if self.thumbnail_file:
-                logger.info(f"   縮圖: {self.thumbnail_file.name}")
+            logger.info(f"   縮圖: {self.thumbnail_file.name if self.thumbnail_file else 'None'}")
             logger.info(f"   時長: {self.video_info.get('duration', 'N/A')} 秒")
             
             return True
             
         except subprocess.TimeoutExpired:
-            logger.error("❌ 下載超時 (10分鐘)")
+            logger.error("[ERROR] 下載超時 (10分鐘)")
             return False
         except Exception as e:
-            logger.error(f"❌ 下載失敗: {str(e)}", exc_info=True)
+            logger.error(f"[ERROR] 下載失敗: {str(e)}", exc_info=True)
             return False
             
     def _generate_thumbnail_from_video(self):
@@ -182,21 +223,21 @@ class VideoProcessor:
             thumbnail_path = Path(self.temp_dir) / f"{self.task_id}_thumb.jpg"
             cmd = [
                 'ffmpeg', '-i', str(self.video_file),
-                '-ss', '00:00:01',
+                '-ss', '00:00:01',  # 從第1秒截圖
                 '-vframes', '1',
-                '-q:v', '2',
+                '-q:v', '2',  # 高品質
                 str(thumbnail_path)
             ]
             
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             if result.returncode == 0 and thumbnail_path.exists():
                 self.thumbnail_file = thumbnail_path
-                logger.info("✅ 成功從影片生成縮圖")
+                logger.info("[SUCCESS] 成功從影片生成縮圖")
             else:
-                logger.warning("⚠️ 無法生成縮圖")
+                logger.warning("[WARNING] 無法生成縮圖")
                 
         except Exception as e:
-            logger.warning(f"⚠️ 縮圖生成失敗: {str(e)}")
+            logger.warning(f"[WARNING] 縮圖生成失敗: {str(e)}")
             
     def _get_file_size(self, file_path: Path) -> str:
         """取得檔案大小的可讀格式"""
@@ -247,20 +288,18 @@ class VideoProcessor:
                 ContentType='application/json'
             )
             
-            # ✅ 修正：生成公開 URL（支援您的變數命名）
-            public_url_base = os.getenv('R2_PUBLIC_URL_BASE')
-            if public_url_base:
-                # 移除尾部斜線，確保 URL 格式正確
-                base_url = public_url_base.rstrip('/')
+            # 生成公開 URL
+            custom_domain = os.getenv('R2_CUSTOM_DOMAIN')
+            if custom_domain:
+                base_url = f"https://{custom_domain}"
             else:
-                # 使用預設的 R2 URL 格式
                 base_url = f"https://{self.r2_bucket}.{self.r2_account_id}.r2.cloudflarestorage.com"
                 
             self.video_url_r2 = f"{base_url}/{video_key}"
             self.thumbnail_url_r2 = f"{base_url}/{thumbnail_key}" if thumbnail_key else None
             self.r2_path = base_path
             
-            logger.info(f"✅ 上傳到 R2 完成: {base_path}")
+            logger.info(f"[SUCCESS] 上傳到 R2 完成: {base_path}")
             logger.info(f"   影片 URL: {self.video_url_r2}")
             if self.thumbnail_url_r2:
                 logger.info(f"   縮圖 URL: {self.thumbnail_url_r2}")
@@ -268,7 +307,7 @@ class VideoProcessor:
             return True
             
         except Exception as e:
-            logger.error(f"❌ R2 上傳失敗: {str(e)}", exc_info=True)
+            logger.error(f"[ERROR] R2 上傳失敗: {str(e)}", exc_info=True)
             return False
             
     def _upload_file_to_r2(self, file_path: Path, key: str, content_type: str):
@@ -279,9 +318,9 @@ class VideoProcessor:
                     f, self.r2_bucket, key,
                     ExtraArgs={'ContentType': content_type}
                 )
-            logger.info(f"✅ 上傳成功: {key}")
+            logger.info(f"[SUCCESS] 上傳成功: {key}")
         except Exception as e:
-            logger.error(f"❌ 上傳失敗 {key}: {str(e)}")
+            logger.error(f"[ERROR] 上傳失敗 {key}: {str(e)}")
             raise
 
     def generate_ai_content(self) -> bool:
@@ -333,17 +372,17 @@ class VideoProcessor:
             
             # 驗證生成的內容
             if self._validate_ai_content(self.ai_content):
-                logger.info("✅ AI 內容生成完成且通過驗證")
+                logger.info("[SUCCESS] AI 內容生成完成且通過驗證")
                 return True
             else:
-                logger.warning("⚠️ AI 內容驗證失敗，使用預設內容")
+                logger.warning("[WARNING] AI 內容驗證失敗，使用預設內容")
                 self._use_fallback_content()
                 return True
             
         except Exception as e:
-            logger.error(f"❌ AI 內容生成失敗: {str(e)}", exc_info=True)
+            logger.error(f"[ERROR] AI 內容生成失敗: {str(e)}", exc_info=True)
             self._use_fallback_content()
-            return True
+            return True  # 不讓 AI 失敗阻止整個流程
             
     def _validate_ai_content(self, content: Dict[str, Any]) -> bool:
         """驗證 AI 生成內容的品質"""
@@ -392,6 +431,14 @@ class VideoProcessor:
 
     def send_webhook_result(self, success: bool = True, error_message: Optional[str] = None):
         """發送處理結果到 n8n Webhook"""
+        if self.test_mode:
+            logger.info("[TASK] 測試模式：跳過 Webhook 發送")
+            return
+            
+        if not self.webhook_url:
+            logger.warning("[WARNING] 未設置 Webhook URL，跳過發送")
+            return
+            
         try:
             headers = {
                 'Content-Type': 'application/json',
@@ -448,21 +495,21 @@ class VideoProcessor:
             )
             response.raise_for_status()
             
-            logger.info(f"✅ 結果已成功發送到 Webhook (狀態碼: {response.status_code})")
+            logger.info(f"[SUCCESS] 結果已成功發送到 n8n (狀態碼: {response.status_code})")
             
         except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Webhook 網路錯誤: {str(e)}", exc_info=True)
+            logger.error(f"[ERROR] Webhook 網路錯誤: {str(e)}", exc_info=True)
         except Exception as e:
-            logger.error(f"❌ Webhook 發送錯誤: {str(e)}", exc_info=True)
+            logger.error(f"[ERROR] Webhook 發送錯誤: {str(e)}", exc_info=True)
             
     def cleanup(self):
         """清理臨時檔案"""
         try:
             if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
                 shutil.rmtree(self.temp_dir)
-                logger.info(f"🗑️ 清理臨時目錄: {self.temp_dir}")
+                logger.info(f"[CLEANUP] 清理臨時目錄: {self.temp_dir}")
         except Exception as e:
-            logger.warning(f"⚠️ 清理失敗: {str(e)}")
+            logger.warning(f"[WARNING] 清理失敗: {str(e)}")
             
     def process(self):
         """主要處理流程"""
@@ -477,35 +524,35 @@ class VideoProcessor:
             self.create_temp_directory()
             
             # 2. 下載影片
-            logger.info("🔽 階段 1: 下載影片")
+            logger.info("[DOWNLOAD] 階段 1: 下載影片")
             if not self.download_video():
                 raise Exception("影片下載階段失敗")
                 
             # 3. 上傳到 R2
-            logger.info("☁️ 階段 2: 上傳到 R2")
+            logger.info("[CLOUD] 階段 2: 上傳到 R2")
             if not self.upload_to_r2():
                 raise Exception("R2 上傳階段失敗")
                 
             # 4. 生成 AI 內容
-            logger.info("🤖 階段 3: 生成 AI 內容")
+            logger.info("[AI] 階段 3: 生成 AI 內容")
             self.generate_ai_content()
             
             # 5. 發送成功結果
-            logger.info("📤 階段 4: 發送結果")
+            logger.info("[SEND] 階段 4: 發送結果")
             self.send_webhook_result(success=True)
             
             processing_time = time.time() - start_time
             logger.info("="*50)
-            logger.info(f"🎉 任務 {self.task_id} 處理完成！")
-            logger.info(f"⏱️ 總處理時間: {processing_time:.2f} 秒")
+            logger.info(f"[COMPLETE] 任務 {self.task_id} 處理完成！")
+            logger.info(f"[TIME] 總處理時間: {processing_time:.2f} 秒")
             logger.info("="*50)
             
         except Exception as e:
             processing_time = time.time() - start_time
             error_msg = str(e)
             logger.error("="*50)
-            logger.error(f"💥 任務 {self.task_id} 處理失敗: {error_msg}")
-            logger.error(f"⏱️ 失敗前處理時間: {processing_time:.2f} 秒")
+            logger.error(f"[FAILED] 任務 {self.task_id} 處理失敗: {error_msg}")
+            logger.error(f"[TIME] 失敗前處理時間: {processing_time:.2f} 秒")
             logger.error("="*50, exc_info=True)
             
             self.send_webhook_result(success=False, error_message=error_msg)
