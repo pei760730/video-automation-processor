@@ -1,0 +1,97 @@
+# .github/workflows/process_video.yml
+name: 短影音內容處理器
+
+on:
+  repository_dispatch:
+    types: [process_sheet_task]
+
+  # 為了方便測試，增加手動觸發
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: '影片 URL'
+        required: true
+        default: 'https://www.youtube.com/watch?v=y_6aSG2yfe8'
+      task_name:
+        description: '任務名稱'
+        required: true
+        default: '手動觸發測試'
+      gsheet_row_index:
+        description: 'GSheet 行號'
+        required: true
+        default: '1000'
+
+jobs:
+  process-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg
+        
+    - name: Cache pip dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+        
+    - name: Install Python dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Validate input
+      run: |
+        echo "Task: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}"
+        echo "Video URL: ${{ github.event.client_payload.video_url || github.event.inputs.video_url }}"
+        echo "Row Index: ${{ github.event.client_payload.gsheet_row_index || github.event.inputs.gsheet_row_index }}"
+        
+    - name: Process video task
+      env:
+        # Cloudflare R2 配置
+        R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+        R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+        R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        R2_CUSTOM_DOMAIN: ${{ secrets.R2_CUSTOM_DOMAIN }}
+        
+        # OpenAI 配置
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        
+        # n8n Webhook 配置
+        N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
+        N8N_WEBHOOK_SECRET: ${{ secrets.N8N_WEBHOOK_SECRET }}
+        
+        # 任務參數 (根據觸發方式決定來源)
+        VIDEO_URL: ${{ github.event.client_payload.video_url || github.event.inputs.video_url }}
+        TASK_NAME: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}
+        ASSIGNEE: ${{ github.event.client_payload.assignee }}
+        PHOTOGRAPHER: ${{ github.event.client_payload.photographer }}
+        SHOOT_DATE: ${{ github.event.client_payload.shoot_date }}
+        NOTES: ${{ github.event.client_payload.notes }}
+        GSHEET_ROW_INDEX: ${{ github.event.client_payload.gsheet_row_index || github.event.inputs.gsheet_row_index }}
+        
+      run: python process_task.py
+      
+    - name: Upload logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: processing-logs-${{ github.run_id }}
+        path: |
+          processing.log
+          /tmp/video_processor_*/**
+        retention-days: 7
