@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# process_task.py - 短影音處理核心引擎 (Windows 編碼修復版)
+# process_task.py - 短影音處理核心引擎 (優化版)
 
 import os
 import sys
@@ -430,52 +430,85 @@ class VideoProcessor:
         }
 
     def send_webhook_result(self, success: bool = True, error_message: Optional[str] = None):
-        """發送處理結果到 n8n Webhook"""
+        """
+        把結果 POST 回 n8n webhook
+        —— 成功時：帶完整 Notion-friendly JSON
+        —— 失敗時：帶錯誤訊息
+        """
         if self.test_mode:
             logger.info("[TASK] 測試模式：跳過 Webhook 發送")
             return
-            
         if not self.webhook_url:
             logger.warning("[WARNING] 未設置 Webhook URL，跳過發送")
             return
-            
+
         try:
-            headers = {
-                'Content-Type': 'application/json',
-                'User-Agent': 'VideoProcessor/1.0'
-            }
-            
+            headers = {"Content-Type": "application/json", "User-Agent": "VideoProcessor/1.0"}
+
             if success:
+                # -------- 內容區塊 & 屬性組裝 --------
+                tags_arr = self.ai_content.get("標籤建議", [])
+                if isinstance(tags_arr, str):                # 若不小心傳成字串
+                    tags_arr = [t.strip() for t in tags_arr.split(",") if t.strip()]
+
+                properties = {
+                    "任務名稱": self.task_name,
+                    "負責人": self.assignee,
+                    "攝影師": self.photographer,
+                    "拍攝日期": self.shoot_date,
+                    "影片時長": f"{self.video_info.get('duration', 0)}秒",
+                    "原始連結": self.video_url,
+                    "R2影片連結": getattr(self, 'video_url_r2', ''),
+                    "R2縮圖連結": getattr(self, 'thumbnail_url_r2', ''),
+                    "AI標題建議": "\n".join(self.ai_content.get("標題建議", [])),
+                    "內容摘要": self.ai_content.get("內容摘要", ''),
+                    "標籤建議": tags_arr,
+                    "內容分類": self.ai_content.get("內容分類", ''),
+                    "目標受眾": self.ai_content.get("目標受眾", ''),
+                    "SEO關鍵詞": ", ".join(self.ai_content.get("SEO關鍵詞", [])),
+                    "備註": self.notes,
+                    "處理時間": datetime.now().isoformat(),
+                    "檔案大小": self._get_file_size(self.video_file) if hasattr(self, 'video_file') else ''
+                }
+                # 移除 value 為 None、空字串、空 list 的欄位（Notion 會報錯）
+                properties = {k: v for k, v in properties.items() if v not in (None, "", [])}
+
                 payload = {
                     "status": "success",
                     "secret": self.webhook_secret,
                     "task_id": self.task_id,
                     "gsheet_row_index": self.row_index,
-                    "task_data": {
-                        "任務名稱": self.task_name,
-                        "負責人": self.assignee,
-                        "攝影師": self.photographer,
-                        "拍攝日期": self.shoot_date,
-                        "備註": self.notes,
-                        "原始連結": self.video_url
+                    "page_title": self.ai_content["標題建議"][0] if self.ai_content.get("標題建議") else self.task_name,
+                    "properties": properties,
+                    "content_blocks": {
+                        "thumbnail_url": getattr(self, 'thumbnail_url_r2', ''),
+                        "ai_titles": self.ai_content.get("標題建議", []),
+                        "summary": self.ai_content.get("內容摘要", ''),
+                        "tags": tags_arr,
+                        "creative_points": self.ai_content.get("創意要點", ''),
+                        "publish_suggestion": self.ai_content.get("發布建議", {}),
+                        "target_audience": self.ai_content.get("目標受眾", ''),
+                        "seo_keywords": self.ai_content.get("SEO關鍵詞", []),
+                        "screenshots": []  # 之後可擴充
                     },
-                    "r2_data": {
-                        "video_url": self.video_url_r2,
-                        "thumbnail_url": self.thumbnail_url_r2,
-                        "r2_path": self.r2_path
-                    },
-                    "ai_content": self.ai_content,
                     "video_info": {
-                        "duration": self.video_info.get('duration'),
-                        "title": self.video_info.get('title'),
-                        "extractor": self.video_info.get('extractor')
+                        "duration": self.video_info.get("duration"),
+                        "title": self.video_info.get("title"),
+                        "extractor": self.video_info.get("extractor"),
+                        "file_size": self._get_file_size(self.video_file) if hasattr(self, 'video_file') else None
                     },
                     "processed_time": datetime.now().isoformat(),
                     "processing_stats": {
-                        "video_size": self._get_file_size(self.video_file) if hasattr(self, 'video_file') else None,
-                        "thumbnail_generated": self.thumbnail_file is not None
-                    }
+                        "video_size": self._get_file_size(self.video_file) if hasattr(self, "video_file") else None,
+                        "thumbnail_generated": bool(getattr(self, 'thumbnail_file', None)),
+                        "r2_path": getattr(self, 'r2_path', '')
+                    },
                 }
+                
+                # Debug 模式時印出 payload
+                if os.getenv('DEBUG_MODE', 'false').lower() == 'true':
+                    logger.debug(f"Payload structure:\n{json.dumps(payload, indent=2, ensure_ascii=False)}")
+                    
             else:
                 payload = {
                     "status": "error",
@@ -484,23 +517,17 @@ class VideoProcessor:
                     "gsheet_row_index": self.row_index,
                     "task_name": self.task_name,
                     "error_message": error_message,
-                    "processed_time": datetime.now().isoformat()
+                    "processed_time": datetime.now().isoformat(),
                 }
-                
-            response = requests.post(
-                self.webhook_url, 
-                json=payload, 
-                headers=headers,
-                timeout=30
-            )
-            response.raise_for_status()
-            
-            logger.info(f"[SUCCESS] 結果已成功發送到 n8n (狀態碼: {response.status_code})")
-            
+
+            resp = requests.post(self.webhook_url, json=payload, headers=headers, timeout=30)
+            resp.raise_for_status()
+            logger.info(f"[SUCCESS] 已發送 Webhook（HTTP {resp.status_code}）")
+
         except requests.exceptions.RequestException as e:
-            logger.error(f"[ERROR] Webhook 網路錯誤: {str(e)}", exc_info=True)
+            logger.error(f"[ERROR] Webhook 連線失敗: {e}", exc_info=True)
         except Exception as e:
-            logger.error(f"[ERROR] Webhook 發送錯誤: {str(e)}", exc_info=True)
+            logger.error(f"[ERROR] Webhook 發送異常: {e}", exc_info=True)
             
     def cleanup(self):
         """清理臨時檔案"""
