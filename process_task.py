@@ -320,6 +320,7 @@ class VideoProcessor:
   "標籤建議": ["#標籤1", "#標籤2", "#標籤3", "#標籤4", "#標籤5"],
   "目標受眾": "主要觀眾群體",
   "內容分類": "影片類型",
+  "發布建議": {{"最佳時段": "晚上8-10點", "平台適配": ["YouTube Shorts", "Instagram Reels"]}},
   "創意要點": "3個內容亮點",
   "SEO關鍵詞": ["關鍵詞1", "關鍵詞2", "關鍵詞3"]
 }}
@@ -366,6 +367,9 @@ class VideoProcessor:
             "標籤建議": ["#短影音", "#精彩內容", "#分享", "#推薦", "#熱門"],
             "目標受眾": "一般觀眾",
             "內容分類": "綜合",
+            "發布建議": {
+                "最佳時段": "晚上8-10點",
+                "平台適配": ["YouTube Shorts", "Instagram Reels", "TikTok"]
             },
             "創意要點": "內容豐富、畫面精彩、適合分享",
             "SEO關鍵詞": [self.task_name, "短影音", "精彩"]
@@ -399,6 +403,7 @@ class VideoProcessor:
                         "內容摘要": self.ai_content.get("內容摘要", ""),
                         "標籤建議": ", ".join(self.ai_content.get("標籤建議", [])),
                         "內容分類": self.ai_content.get("內容分類", ""),
+                        "目標受眾": self.ai_content.get("目標受眾", ""),
                         "SEO關鍵詞": ", ".join(self.ai_content.get("SEO關鍵詞", [])),
                         "備註": self.notes,
                         "處理時間": datetime.now().isoformat()
@@ -409,6 +414,7 @@ class VideoProcessor:
                         "summary": self.ai_content.get("內容摘要", ""),
                         "tags": self.ai_content.get("標籤建議", []),
                         "creative_points": self.ai_content.get("創意要點", ""),
+                        "publish_suggestion": self.ai_content.get("發布建議", {})
                     },
                     "processed_time": datetime.now().isoformat()
                 }
