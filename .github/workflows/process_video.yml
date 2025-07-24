@@ -1,44 +1,54 @@
-# .github/workflows/process_video.yml
-name: 短影音內容處理器
+# .github/workflows/process-video.yml - 優化整合版
+
+name: Process Video from n8n
 
 on:
+  # 允許 n8n 透過 API 觸發
   repository_dispatch:
     types: [process_sheet_task]
-  # 為了方便測試，增加手動觸發
+    
+  # 允許手動在 GitHub 介面觸發，方便測試
   workflow_dispatch:
     inputs:
       video_url:
         description: '影片 URL'
         required: true
-        default: 'https://www.youtube.com/watch?v=y_6aSG2yfe8'
       task_name:
         description: '任務名稱'
         required: true
-        default: '手動觸發測試'
+        default: '手動測試任務'
       gsheet_row_index:
-        description: 'GSheet 行號'
+        description: 'Google Sheet 行號'
         required: true
-        default: '1000'
+        default: '999'
 
 jobs:
   process-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     
     steps:
+    # 步驟 1: 從 GitHub 拉取最新的程式碼
     - name: Checkout repository
       uses: actions/checkout@v4
       
-    - name: Set up Python
+    # 步驟 2: 設定 Python 環境
+    - name: Set up Python 3.11
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
         
-    - name: Install system dependencies
+    # 步驟 3: 安裝系統依賴 (ffmpeg 和 yt-dlp)
+    - name: Install system dependencies (ffmpeg & yt-dlp)
       run: |
         sudo apt-get update
         sudo apt-get install -y ffmpeg
+        # 直接安裝最新版 yt-dlp，比 pip 更可靠
+        sudo wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
+        sudo chmod a+rx /usr/local/bin/yt-dlp
+        echo "yt-dlp version:"
+        yt-dlp --version
         
+    # 步驟 4: 快取 Python 依賴項，加速後續執行
     - name: Cache pip dependencies
       uses: actions/cache@v4
       with:
@@ -47,49 +57,54 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-pip-
         
-    - name: Install Python dependencies
+    # 步驟 5: 安裝 Python 函式庫
+    - name: Install Python dependencies from requirements.txt
       run: |
-        pip install --upgrade pip
+        python -m pip install --upgrade pip
         pip install -r requirements.txt
         
-    - name: Validate input
-      run: |
-        echo "Task: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}"
-        echo "Video URL: ${{ github.event.client_payload.video_url || github.event.inputs.video_url }}"
-        echo "Row Index: ${{ github.event.client_payload.gsheet_row_index || github.event.inputs.gsheet_row_index }}"
-        
-    - name: Process video task
+    # 步驟 6: 執行我們的核心 Python 腳本 (main.py)
+    # 這是最關鍵的步驟，整合了所有 env 和 run 指令
+    - name: Run Python Processor
+      timeout-minutes: 15 # 設置15分鐘超時，防止任務卡死
       env:
-        # Cloudflare R2 配置
-        R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-        R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
-        R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
-        R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        R2_CUSTOM_DOMAIN: ${{ secrets.R2_CUSTOM_DOMAIN }}
-        
-        # OpenAI 配置
+        # --- API Keys & Config (從 GitHub Secrets 讀取) ---
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
+        NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         
-        # n8n Webhook 配置
+        # --- Webhook (從 GitHub Secrets 讀取) ---
         N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
         N8N_WEBHOOK_SECRET: ${{ secrets.N8N_WEBHOOK_SECRET }}
+
+        # --- R2 Storage (從 GitHub Secrets 讀取) ---
+        R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }} # 新增，讓 Python 可以生成正確的公開連結
         
-        # 任務參數 (根據觸發方式決定來源)
+        # --- Task Data (從 n8n 或手動觸發中讀取) ---
         VIDEO_URL: ${{ github.event.client_payload.video_url || github.event.inputs.video_url }}
         TASK_NAME: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}
-        ASSIGNEE: ${{ github.event.client_payload.assignee || '測試員' }}
-        PHOTOGRAPHER: ${{ github.event.client_payload.photographer || '測試攝影師' }}
-        SHOOT_DATE: ${{ github.event.client_payload.shoot_date || '2025-07-18' }}
-        NOTES: ${{ github.event.client_payload.notes || '雲端測試' }}
         GSHEET_ROW_INDEX: ${{ github.event.client_payload.gsheet_row_index || github.event.inputs.gsheet_row_index }}
+        ASSIGNEE: ${{ github.event.client_payload.assignee || '未指定' }}
+        PHOTOGRAPHER: ${{ github.event.client_payload.photographer || '未指定' }}
+        SHOOT_DATE: ${{ github.event.client_payload.shoot_date || '' }}
+        NOTES: ${{ github.event.client_payload.notes || '' }}
         
-      run: python process_task.py
+      run: |
+        echo "🏃‍♂️ Starting main.py..."
+        python main.py
+        echo "🏁 main.py finished."
       
-    - name: Upload logs on failure
-      if: failure()
+    # 步驟 7: 無論成功或失敗，都嘗試上傳日誌文件
+    - name: Upload logs on failure or success
+      if: always() # `always()` 確保這一步總會執行
       uses: actions/upload-artifact@v4
       with:
         name: processing-logs-${{ github.run_id }}
         path: |
-          processing.log
-        retention-days: 7
+          processing.log # 我們 Python 腳本生成的日誌
+          *.log
+        retention-days: 7 # 日誌保留7天
