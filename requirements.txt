@@ -1,17 +1,12 @@
-# 基本依賴
-python-dotenv==1.0.0
+# === 核心與異步處理 ===
 aiohttp==3.9.1
-asyncio==3.4.3
+python-dotenv==1.0.0
 
-# Notion
+# === API 客戶端 ===
 notion-client==2.2.1
-
-# 影片處理
-yt-dlp==2024.5.27
-
-# AI 分析
 openai==1.35.0
+boto3==1.34.120
 
-# 工具
-requests==2.31.0
-python-dateutil==2.8.2
+# === 影片處理 ===
+yt-dlp==2024.04.09
+ffmpeg-python==0.2.0
