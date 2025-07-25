@@ -1,26 +1,33 @@
-# .github/workflows/process-video.yml - 優化整合版
+# .github/workflows/process-video.yml - 優化整合版 v2 (對應 NotionVideoProcessor)
 
-name: Process Video from n8n
+name: Process Video from Notion Trigger
 
 on:
-  # 允許 n8n 透過 API 觸發
+  # 允許 n8n/Make.com 透過 API 觸發
   repository_dispatch:
-    types: [process_sheet_task]
+    types: [process_notion_task]
     
   # 允許手動在 GitHub 介面觸發，方便測試
   workflow_dispatch:
     inputs:
-      video_url:
+      notion_page_id:
+        description: '要處理的 Notion Page ID'
+        required: true
+      original_link:
         description: '影片 URL'
         required: true
       task_name:
         description: '任務名稱'
         required: true
         default: '手動測試任務'
-      gsheet_row_index:
-        description: 'Google Sheet 行號'
-        required: true
-        default: '999'
+      person_in_charge:
+        description: '負責人'
+        required: false
+        default: '手動測試員'
+      videographer:
+        description: '攝影師'
+        required: false
+        default: '手動測試員'
 
 jobs:
   process-video:
@@ -42,13 +49,12 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y ffmpeg
-        # 直接安裝最新版 yt-dlp，比 pip 更可靠
         sudo wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
         sudo chmod a+rx /usr/local/bin/yt-dlp
         echo "yt-dlp version:"
         yt-dlp --version
         
-    # 步驟 4: 快取 Python 依賴項，加速後續執行
+    # 步驟 4: 快取 Python 依賴項
     - name: Cache pip dependencies
       uses: actions/cache@v4
       with:
@@ -64,47 +70,49 @@ jobs:
         pip install -r requirements.txt
         
     # 步驟 6: 執行我們的核心 Python 腳本 (main.py)
-    # 這是最關鍵的步驟，整合了所有 env 和 run 指令
+    # 更新了環境變數以匹配新的 notion_video_processor.py
     - name: Run Python Processor
-      timeout-minutes: 15 # 設置15分鐘超時，防止任務卡死
+      id: run-processor # 給這個步驟一個 id，方便後續引用它的輸出
+      timeout-minutes: 15
       env:
         # --- API Keys & Config (從 GitHub Secrets 讀取) ---
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
-        NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
         
-        # --- Webhook (從 GitHub Secrets 讀取) ---
-        N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL }}
-        N8N_WEBHOOK_SECRET: ${{ secrets.N8N_WEBHOOK_SECRET }}
-
-        # --- R2 Storage (從 GitHub Secrets 讀取) ---
+        # --- R2 Storage (從 GitHub Secrets 讀取，名稱已更新) ---
         R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-        R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-        R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-        R2_PUBLIC_URL: ${{ secrets.R2_PUBLIC_URL }} # 新增，讓 Python 可以生成正確的公開連結
-        
-        # --- Task Data (從 n8n 或手動觸發中讀取) ---
-        VIDEO_URL: ${{ github.event.client_payload.video_url || github.event.inputs.video_url }}
+        R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY_ID }}      # 使用 R2_ACCESS_KEY_ID 也可，但建議在 secrets 中統一為 R2_ACCESS_KEY
+        R2_SECRET_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}  # 使用 R2_SECRET_ACCESS_KEY 也可，但建議在 secrets 中統一為 R2_SECRET_KEY
+        R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}            # 使用 R2_BUCKET_NAME 也可，但建議在 secrets 中統一為 R2_BUCKET
+        R2_CUSTOM_DOMAIN: ${{ secrets.R2_PUBLIC_URL }}      # 使用 R2_PUBLIC_URL 也可，但建議在 secrets 中統一為 R2_CUSTOM_DOMAIN
+
+        # --- Task Data (從 n8n/Make.com 或手動觸發中讀取，名稱已更新) ---
+        NOTION_PAGE_ID: ${{ github.event.client_payload.notion_page_id || github.event.inputs.notion_page_id }}
+        ORIGINAL_LINK: ${{ github.event.client_payload.original_link || github.event.inputs.original_link }}
         TASK_NAME: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}
-        GSHEET_ROW_INDEX: ${{ github.event.client_payload.gsheet_row_index || github.event.inputs.gsheet_row_index }}
-        ASSIGNEE: ${{ github.event.client_payload.assignee || '未指定' }}
-        PHOTOGRAPHER: ${{ github.event.client_payload.photographer || '未指定' }}
-        SHOOT_DATE: ${{ github.event.client_payload.shoot_date || '' }}
-        NOTES: ${{ github.event.client_payload.notes || '' }}
+        PERSON_IN_CHARGE: ${{ github.event.client_payload.person_in_charge || github.event.inputs.person_in_charge }}
+        VIDEOGRAPHER: ${{ github.event.client_payload.videographer || github.event.inputs.videographer }}
         
       run: |
         echo "🏃‍♂️ Starting main.py..."
         python main.py
         echo "🏁 main.py finished."
-      
-    # 步驟 7: 無論成功或失敗，都嘗試上傳日誌文件
-    - name: Upload logs on failure or success
-      if: always() # `always()` 確保這一步總會執行
+
+    # (可選) 步驟 7: 這是與 n8n/Make.com 整合的關鍵步驟
+    # 執行完 Python 後，將結果回傳給自動化工具，由它來更新 Notion
+    - name: Send result back to automation tool (n8n/Make)
+      if: success() && steps.run-processor.outputs.result_json # 只有成功且有結果時才執行
+      uses: anothrNick/github-tag-action@1.67.0 # 這裡用一個簡單的 action 來發送 Webhook
+      env:
+        WEBHOOK_URL: ${{ secrets.YOUR_N8N_OR_MAKE_WEBHOOK_URL }} # 你需要在 secrets 中設定一個回調的 Webhook URL
+        WEBHOOK_DATA: ${{ steps.run-processor.outputs.result_json }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 這是不必要的，但有些action需要
+
+    # 步驟 8: 上傳日誌（如果需要除錯）
+    - name: Upload logs on failure
+      if: failure() # 只有失敗時才上傳，節省資源
       uses: actions/upload-artifact@v4
       with:
-        name: processing-logs-${{ github.run_id }}
+        name: failure-logs-${{ github.run_id }}
         path: |
-          processing.log # 我們 Python 腳本生成的日誌
           *.log
-        retention-days: 7 # 日誌保留7天
+        retention-days: 7
