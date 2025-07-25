@@ -1,13 +1,11 @@
-# .github/workflows/process-video.yml - v2.2 (使用 working-directory 修正路徑問題)
+# .github/workflows/process-video.yml - v2.3 (修正 YAML 語法錯誤)
 
 name: Process Video from Notion Trigger
 
 on:
-  # 允許 n8n/Make.com 透過 API 觸發
   repository_dispatch:
     types: [process_notion_task]
     
-  # 允許手動在 GitHub 介面觸發，方便測試
   workflow_dispatch:
     inputs:
       notion_page_id:
@@ -37,8 +35,9 @@ jobs:
     # 步驟 1: 拉取程式碼
     - name: Checkout repository
       uses: actions/checkout@v4
-      # 這一步會把 repo 內容放到一個同名資料夾下，例如 'video-automation-processor'
-      
+      with:
+        path: video-automation-processor # 將 repo 內容 checkout 到指定子目錄
+
     # 步驟 2: 設定 Python 環境
     - name: Set up Python 3.11
       uses: actions/setup-python@v5
@@ -53,18 +52,19 @@ jobs:
         sudo wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
         sudo chmod a+rx /usr/local/bin/yt-dlp
         
-    # 步驟 4: 快取並安裝 Python 依賴
-    - name: Cache and Install Python dependencies
-      # 我們需要在正確的目錄下執行 pip install，所以這裡也需要指定 working-directory
-      working-directory: ./video-automation-processor
+    # 步驟 4-1: 快取 Python 依賴項
+    - name: Cache pip dependencies
       uses: actions/cache@v4
-      id: cache-pip
       with:
+        # 這裡的路徑需要指向 requirements.txt 所在的位置
+        key: ${{ runner.os }}-pip-${{ hashFiles('video-automation-processor/requirements.txt') }}
         path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
         restore-keys: |
           ${{ runner.os }}-pip-
+
+    # 步驟 4-2: 安裝 Python 函式庫
     - name: Install dependencies
+      # ✅ 關鍵修正：安裝步驟需要指定工作目錄
       working-directory: ./video-automation-processor
       run: |
         python -m pip install --upgrade pip
@@ -77,17 +77,12 @@ jobs:
       # ✅ 關鍵修正：確保所有指令都在 repo 的根目錄下執行
       working-directory: ./video-automation-processor
       env:
-        # --- API Keys & Config (從 GitHub Secrets 讀取) ---
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        
-        # --- R2 Storage (從 GitHub Secrets 讀取) ---
         R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
         R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY_ID }}
         R2_SECRET_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
         R2_CUSTOM_DOMAIN: ${{ secrets.R2_PUBLIC_URL }}
-
-        # --- Task Data (從 n8n 或手動觸發中讀取) ---
         NOTION_PAGE_ID: ${{ github.event.client_payload.notion_page_id || github.event.inputs.notion_page_id }}
         ORIGINAL_LINK: ${{ github.event.client_payload.original_link || github.event.inputs.original_link }}
         TASK_NAME: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}
@@ -99,14 +94,11 @@ jobs:
         python main.py
         echo "🏁 main.py finished."
 
-    # 步驟 6: 上傳日誌（僅在失敗時，用於除錯）
+    # 步驟 6: 上傳日誌（僅在失敗時）
     - name: Upload logs on failure
       if: failure()
-      # 日誌檔案也會在工作目錄下生成，所以這裡也要指定
-      working-directory: ./video-automation-processor
       uses: actions/upload-artifact@v4
       with:
         name: failure-logs-${{ github.run_id }}
-        path: |
-          *.log
+        path: video-automation-processor/*.log
         retention-days: 7
