@@ -1,4 +1,4 @@
-# .github/workflows/process-video.yml - v2.5 (最終穩定版)
+# .github/workflows/process-video.yml - v3.0 (最終穩定版)
 
 name: Process Video from Notion Trigger
 
@@ -26,10 +26,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    # 步驟 1: 拉取程式碼
+    # 步驟 1: 拉取程式碼 (最標準的用法)
+    # 它會自動將您的 repo 內容 checkout 到一個與 repo 同名的子目錄下。
+    # 例如： './video-automation-processor'
     - name: Checkout repository
       uses: actions/checkout@v4
-      # 預設會把 repo 內容 checkout 到與 repo 同名的子目錄下
 
     # 步驟 2: 設定 Python 環境
     - name: Set up Python 3.11
@@ -37,7 +38,7 @@ jobs:
       with:
         python-version: '3.11'
         
-    # 步驟 3: 安裝系統依賴
+    # 步驟 3: 安裝系統依賴 (這個步驟不需要指定目錄)
     - name: Install system dependencies (ffmpeg & yt-dlp)
       run: |
         sudo apt-get update
@@ -45,27 +46,30 @@ jobs:
         sudo wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
         sudo chmod a+rx /usr/local/bin/yt-dlp
         
-    # 步驟 4: 快取並安裝 Python 依賴
+    # 步驟 4: 快取 Python 依賴
+    # ✅ 關鍵語法： 'uses' 步驟自己獨立，不跟 run 混用
     - name: Cache pip dependencies
       uses: actions/cache@v4
       with:
-        # ✅ 關鍵：這裡的 hashFiles 路徑要寫對
+        # ✅ 關鍵路徑：hashFiles 需要知道 requirements.txt 在子目錄裡
         key: ${{ runner.os }}-pip-${{ hashFiles('video-automation-processor/requirements.txt') }}
         path: ~/.cache/pip
         restore-keys: |
           ${{ runner.os }}-pip-
+
+    # 步驟 5: 安裝 Python 函式庫
+    # ✅ 關鍵語法： 'run' 步驟單獨存在，並明確指定工作目錄
     - name: Install dependencies
-      # ✅ 關鍵：明確指定工作目錄
       working-directory: ./video-automation-processor
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
         
-    # 步驟 5: 執行核心 Python 腳本
+    # 步驟 6: 執行核心 Python 腳本
+    # ✅ 關鍵語法：這是解決 ModuleNotFoundError 的最終方案
     - name: Run Python Processor
       id: run-processor
       timeout-minutes: 15
-      # ✅ 關鍵：再次明確指定工作目錄
       working-directory: ./video-automation-processor
       env:
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -84,11 +88,12 @@ jobs:
         python main.py
         echo "🏁 main.py finished."
 
-    # 步驟 6: 上傳日誌（僅在失敗時）
+    # 步驟 7: 上傳日誌（僅在失敗時）
     - name: Upload logs on failure
       if: failure()
       uses: actions/upload-artifact@v4
       with:
         name: failure-logs-${{ github.run_id }}
+        # ✅ 關鍵路徑：日誌檔案也在子目錄裡
         path: video-automation-processor/*.log
         retention-days: 7
