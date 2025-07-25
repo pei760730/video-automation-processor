@@ -1,11 +1,10 @@
-# .github/workflows/process-video.yml - v2.3 (修正 YAML 語法錯誤)
+# .github/workflows/process-video.yml - v2.4 (使用全域 working-directory 修正路徑)
 
 name: Process Video from Notion Trigger
 
 on:
   repository_dispatch:
     types: [process_notion_task]
-    
   workflow_dispatch:
     inputs:
       notion_page_id:
@@ -17,26 +16,25 @@ on:
       task_name:
         description: '任務名稱'
         required: true
-        default: '手動測試任務'
       person_in_charge:
         description: '負責人'
-        required: false
-        default: '手動測試員'
       videographer:
         description: '攝影師'
-        required: false
-        default: '手動測試員'
 
 jobs:
   process-video:
     runs-on: ubuntu-latest
-    
+
+    # ✅ 關鍵修正：為此 job 下的所有 run 指令設定預設工作目錄
+    defaults:
+      run:
+        working-directory: ./video-automation-processor
+
     steps:
-    # 步驟 1: 拉取程式碼
+    # 步驟 1: 拉取程式碼 (使用預設行為)
     - name: Checkout repository
       uses: actions/checkout@v4
-      with:
-        path: video-automation-processor # 將 repo 內容 checkout 到指定子目錄
+      # 這一步會把 repo 內容 checkout 到 './video-automation-processor'
 
     # 步驟 2: 設定 Python 環境
     - name: Set up Python 3.11
@@ -44,28 +42,28 @@ jobs:
       with:
         python-version: '3.11'
         
-    # 步驟 3: 安裝系統依賴
+    # 步驟 3: 安裝系統依賴 (此步驟在根目錄執行，不受 working-directory 影響)
     - name: Install system dependencies (ffmpeg & yt-dlp)
+      # 我們需要移除 defaults，讓這個 sudo 指令在 runner 的根環境執行
+      defaults:
+        run:
+          working-directory: .
       run: |
         sudo apt-get update
         sudo apt-get install -y ffmpeg
         sudo wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
         sudo chmod a+rx /usr/local/bin/yt-dlp
         
-    # 步驟 4-1: 快取 Python 依賴項
+    # 步驟 4: 快取並安裝 Python 依賴
     - name: Cache pip dependencies
       uses: actions/cache@v4
       with:
-        # 這裡的路徑需要指向 requirements.txt 所在的位置
         key: ${{ runner.os }}-pip-${{ hashFiles('video-automation-processor/requirements.txt') }}
         path: ~/.cache/pip
         restore-keys: |
           ${{ runner.os }}-pip-
-
-    # 步驟 4-2: 安裝 Python 函式庫
     - name: Install dependencies
-      # ✅ 關鍵修正：安裝步驟需要指定工作目錄
-      working-directory: ./video-automation-processor
+      # 這個 run 指令會自動使用上面 defaults 設定的 working-directory
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
@@ -74,8 +72,7 @@ jobs:
     - name: Run Python Processor
       id: run-processor
       timeout-minutes: 15
-      # ✅ 關鍵修正：確保所有指令都在 repo 的根目錄下執行
-      working-directory: ./video-automation-processor
+      # 這個 run 指令也會自動使用 working-directory
       env:
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
@@ -88,7 +85,6 @@ jobs:
         TASK_NAME: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}
         PERSON_IN_CHARGE: ${{ github.event.client_payload.person_in_charge || github.event.inputs.person_in_charge }}
         VIDEOGRAPHER: ${{ github.event.client_payload.videographer || github.event.inputs.videographer }}
-        
       run: |
         echo "🏃‍♂️ Starting main.py..."
         python main.py
