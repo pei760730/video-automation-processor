@@ -1,4 +1,4 @@
-# .github/workflows/process-video.yml - v2.4 (使用全域 working-directory 修正路徑)
+# .github/workflows/process-video.yml - v2.5 (最終穩定版)
 
 name: Process Video from Notion Trigger
 
@@ -25,16 +25,11 @@ jobs:
   process-video:
     runs-on: ubuntu-latest
 
-    # ✅ 關鍵修正：為此 job 下的所有 run 指令設定預設工作目錄
-    defaults:
-      run:
-        working-directory: ./video-automation-processor
-
     steps:
-    # 步驟 1: 拉取程式碼 (使用預設行為)
+    # 步驟 1: 拉取程式碼
     - name: Checkout repository
       uses: actions/checkout@v4
-      # 這一步會把 repo 內容 checkout 到 './video-automation-processor'
+      # 預設會把 repo 內容 checkout 到與 repo 同名的子目錄下
 
     # 步驟 2: 設定 Python 環境
     - name: Set up Python 3.11
@@ -42,12 +37,8 @@ jobs:
       with:
         python-version: '3.11'
         
-    # 步驟 3: 安裝系統依賴 (此步驟在根目錄執行，不受 working-directory 影響)
+    # 步驟 3: 安裝系統依賴
     - name: Install system dependencies (ffmpeg & yt-dlp)
-      # 我們需要移除 defaults，讓這個 sudo 指令在 runner 的根環境執行
-      defaults:
-        run:
-          working-directory: .
       run: |
         sudo apt-get update
         sudo apt-get install -y ffmpeg
@@ -58,12 +49,14 @@ jobs:
     - name: Cache pip dependencies
       uses: actions/cache@v4
       with:
+        # ✅ 關鍵：這裡的 hashFiles 路徑要寫對
         key: ${{ runner.os }}-pip-${{ hashFiles('video-automation-processor/requirements.txt') }}
         path: ~/.cache/pip
         restore-keys: |
           ${{ runner.os }}-pip-
     - name: Install dependencies
-      # 這個 run 指令會自動使用上面 defaults 設定的 working-directory
+      # ✅ 關鍵：明確指定工作目錄
+      working-directory: ./video-automation-processor
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
@@ -72,7 +65,8 @@ jobs:
     - name: Run Python Processor
       id: run-processor
       timeout-minutes: 15
-      # 這個 run 指令也會自動使用 working-directory
+      # ✅ 關鍵：再次明確指定工作目錄
+      working-directory: ./video-automation-processor
       env:
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
