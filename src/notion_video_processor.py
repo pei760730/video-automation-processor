@@ -1,414 +1,364 @@
-"""
-Notion 影片處理器 - 優化版
-使用 Multi-select 屬性類型，更精簡的資料結構，增強錯誤處理和日誌功能
-"""
+# 檔案路徑: src/notion_video_processor.py
 
 import os
-import asyncio
+import sys
 import json
-from typing import Dict, Optional, List, Any
-from datetime import datetime, timezone
-from notion_client import AsyncClient
-from notion_client.errors import APIError, RequestTimeoutError
+import tempfile
+import hashlib
 import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field, asdict
 
+import yt_dlp
+import boto3
+from openai import OpenAI
+from botocore.exceptions import ClientError
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+# 設定日誌
 logger = logging.getLogger(__name__)
 
+# --- 直接對應 Notion 欄位的資料結構 ---
+@dataclass
+class NotionTask:
+    """
+    直接映射 Notion "Video Pipeline" 資料庫的資料結構。
+    """
+    # === 輸入欄位 (來自 Notion / 環境變數) ===
+    notion_page_id: str         # 用來更新 Notion 特定頁面的 ID
+    task_name: str              # 對應 Notion 的「任務名稱」
+    person_in_charge: str       # 對應 Notion 的「負責人」
+    videographer: str           # 對應 Notion 的「攝影師」
+    original_link: str          # 對應 Notion 的「原始連結」
+    
+    # === 處理中/輸出欄位 (由程式生成) ===
+    status: str = "處理中"      # 對應 Notion 的「狀態」
+    
+    # 儲存到 R2 的結果連結
+    processed_video_url: Optional[str] = None
+    processed_thumbnail_url: Optional[str] = None
+    
+    # AI 生成的內容，對應 Notion 欄位
+    ai_title_suggestions: List[str] = field(default_factory=list) # 對應「AI標題建議」
+    ai_content_summary: Optional[str] = None                      # 對應「內容摘要」
+    ai_tag_suggestions: List[str] = field(default_factory=list)   # 對應「標籤建議」
+
+    # 處理過程中的內部資訊
+    task_id: str = ""           # 本次處理的唯一 ID，用於命名檔案
+    error_message: Optional[str] = None # 如果失敗，記錄錯誤訊息
+
+    def __post_init__(self):
+        """在初始化後，生成唯一的 task_id"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        hash_input = f"{self.original_link}_{timestamp}"
+        hash_suffix = hashlib.md5(hash_input.encode()).hexdigest()[:8]
+        self.task_id = f"task_{timestamp}_{hash_suffix}"
+
+# --- 核心處理器 ---
 class NotionVideoProcessor:
-    """Notion 影片處理器 - 重構優化版"""
-    
+    """
+    為 Notion Video Pipeline 設計的影片處理器 - 生產版本
+    """
     def __init__(self):
-        """初始化 Notion 處理器"""
-        self.api_key = os.environ.get("NOTION_API_KEY")
-        self.database_id = os.environ.get("NOTION_DATABASE_ID")
+        """初始化，讀取環境變數並設定客戶端"""
+        self.temp_dir = tempfile.mkdtemp(prefix='video_pipeline_')
+        self._setup_task_from_env()
+        self._setup_clients()
+        logger.info(f"✅ Notion 影片處理器初始化完成 - Task ID: {self.task.task_id}")
+
+    def _setup_task_from_env(self):
+        """從環境變數讀取資訊，建立 NotionTask 物件"""
+        required_vars = [
+            'NOTION_PAGE_ID', 'TASK_NAME', 'PERSON_IN_CHARGE',
+            'VIDEOGRAPHER', 'ORIGINAL_LINK'
+        ]
+        missing_vars = [var for var in required_vars if not os.getenv(var)]
+        if missing_vars:
+            raise ValueError(f"❌ 缺少必要的環境變數: {', '.join(missing_vars)}")
         
-        # 配置驗證
-        if not self.api_key or not self.database_id:
-            logger.warning("⚠️ Notion 配置不完整，將跳過 Notion 操作")
-            logger.warning(f"   API Key: {'已設置' if self.api_key else '未設置'}")
-            logger.warning(f"   Database ID: {'已設置' if self.database_id else '未設置'}")
-            self.enabled = False
-            self.client = None
+        self.task = NotionTask(
+            notion_page_id=os.getenv('NOTION_PAGE_ID'),
+            task_name=os.getenv('TASK_NAME'),
+            person_in_charge=os.getenv('PERSON_IN_CHARGE'),
+            videographer=os.getenv('VIDEOGRAPHER'),
+            original_link=os.getenv('ORIGINAL_LINK')
+        )
+        logger.info(f"📋 任務資料載入成功 - {self.task.task_name}")
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    def _setup_clients(self):
+        """設定 OpenAI 和 R2 客戶端"""
+        # 檢查 OpenAI API Key
+        openai_key = os.getenv('OPENAI_API_KEY')
+        if not openai_key:
+            raise ValueError("❌ 缺少 OPENAI_API_KEY 環境變數")
+        
+        try:
+            self.openai_client = OpenAI(api_key=openai_key, timeout=60.0)
+            logger.info("✅ OpenAI 客戶端初始化成功")
+        except Exception as e:
+            raise ValueError(f"❌ OpenAI 客戶端初始化失敗: {e}")
+        
+        # 檢查 R2 配置
+        r2_config = {
+            'account_id': os.getenv('R2_ACCOUNT_ID'),
+            'access_key': os.getenv('R2_ACCESS_KEY'),
+            'secret_key': os.getenv('R2_SECRET_KEY'),
+            'bucket': os.getenv('R2_BUCKET')
+        }
+        
+        missing_r2 = [k for k, v in r2_config.items() if not v]
+        if missing_r2:
+            logger.warning(f"⚠️ R2 配置不完整，缺少: {', '.join(missing_r2)}")
+            logger.warning("📁 檔案將保存在本地，不會上傳到雲端")
+            self.r2_client = None
+            self.r2_enabled = False
         else:
-            self.enabled = True
-            self.client = AsyncClient(auth=self.api_key)
-            logger.info(f"✅ Notion 已配置")
-            logger.info(f"   Database ID: {self.database_id[:8]}...")
-    
-    async def validate_database_structure(self) -> bool:
-        """驗證資料庫結構是否符合要求"""
-        if not self.enabled:
-            return False
-        
-        try:
-            logger.info("🔍 驗證 Notion 資料庫結構...")
-            database = await self.client.databases.retrieve(database_id=self.database_id)
-            
-            properties = database.get("properties", {})
-            required_fields = {
-                "任務名稱": "title",
-                "狀態": "select", 
-                "AI標題建議": "multi_select",
-                "標籤建議": "multi_select"
-            }
-            
-            missing_fields = []
-            wrong_type_fields = []
-            
-            for field_name, expected_type in required_fields.items():
-                if field_name not in properties:
-                    missing_fields.append(field_name)
-                elif properties[field_name]["type"] != expected_type:
-                    wrong_type_fields.append(f"{field_name} (期望: {expected_type}, 實際: {properties[field_name]['type']})")
-            
-            if missing_fields or wrong_type_fields:
-                logger.error("❌ 資料庫結構驗證失敗")
-                if missing_fields:
-                    logger.error(f"   缺少欄位: {', '.join(missing_fields)}")
-                if wrong_type_fields:
-                    logger.error(f"   類型錯誤: {', '.join(wrong_type_fields)}")
-                return False
-            
-            logger.info("✅ 資料庫結構驗證通過")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ 驗證資料庫結構時發生錯誤：{str(e)}")
-            return False
-    
-    async def create_page(self, task_data: Dict, ai_content: Dict) -> Optional[Dict]:
-        """創建 Notion 頁面 - 優化版"""
-        if not self.enabled:
-            logger.warning("Notion 未啟用，跳過創建頁面")
-            return None
-        
-        # 驗證資料庫結構
-        if not await self.validate_database_structure():
-            logger.error("資料庫結構驗證失敗，跳過創建頁面")
-            return None
-        
-        try:
-            # 準備頁面屬性
-            properties = self._prepare_page_properties(task_data, ai_content)
-            
-            # 創建頁面內容
-            children = self._create_page_content(task_data, ai_content)
-            
-            # 創建 Notion 頁面
-            task_name = task_data.get("task_name", "未命名任務")
-            logger.info(f"📝 創建 Notion 頁面：{task_name}")
-            
-            response = await self._create_page_with_retry(properties, children)
-            
-            if response:
-                logger.info(f"✅ Notion 頁面創建成功")
-                logger.info(f"   ID: {response['id']}")
-                logger.info(f"   URL: {response['url']}")
-                
-                return {
-                    "id": response["id"],
-                    "url": response["url"],
-                    "created_time": response["created_time"],
-                    "status": "success"
-                }
-            else:
-                return None
-            
-        except Exception as e:
-            logger.error(f"❌ 創建 Notion 頁面失敗：{str(e)}")
-            logger.error(f"   錯誤類型：{type(e).__name__}")
-            logger.error(f"   任務名稱：{task_data.get('task_name', 'Unknown')}")
-            return None
-    
-    def _prepare_page_properties(self, task_data: Dict, ai_content: Dict) -> Dict:
-        """準備頁面屬性"""
-        properties = {
-            "任務名稱": {
-                "title": [{"text": {"content": task_data.get("task_name", "未命名任務")}}]
-            },
-            "狀態": {
-                "select": {"name": "AI處理完成"}
-            }
-        }
-        
-        # 可選文字欄位
-        optional_text_fields = {
-            "負責人": task_data.get("assignee", ""),
-            "攝影師": task_data.get("photographer", ""),
-            "處理時間": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        }
-        
-        for field_name, value in optional_text_fields.items():
-            if value:
-                properties[field_name] = {
-                    "rich_text": [{"text": {"content": str(value)}}]
-                }
-        
-        # URL 欄位
-        if task_data.get("video_url"):
-            properties["原始連結"] = {
-                "url": task_data.get("video_url", "")
-            }
-        
-        # AI 內容摘要
-        if ai_content.get("summary"):
-            summary_text = ai_content["summary"][:2000]  # Notion 限制
-            properties["內容摘要"] = {
-                "rich_text": [{"text": {"content": summary_text}}]
-            }
-        
-        # AI 標題建議 - Multi-select
-        if ai_content.get("titles") and isinstance(ai_content["titles"], list):
-            valid_titles = [
-                {"name": self._sanitize_option_name(title)} 
-                for title in ai_content["titles"][:5]  # 最多 5 個
-                if title and isinstance(title, str)
-            ]
-            if valid_titles:
-                properties["AI標題建議"] = {"multi_select": valid_titles}
-        
-        # 標籤建議 - Multi-select
-        if ai_content.get("tags") and isinstance(ai_content["tags"], list):
-            valid_tags = [
-                {"name": self._sanitize_option_name(tag)} 
-                for tag in ai_content["tags"][:10]  # 最多 10 個
-                if tag and isinstance(tag, str)
-            ]
-            if valid_tags:
-                properties["標籤建議"] = {"multi_select": valid_tags}
-        
-        return properties
-    
-    def _sanitize_option_name(self, name: str) -> str:
-        """清理選項名稱，確保符合 Notion 要求"""
-        if not isinstance(name, str):
-            return str(name)
-        
-        # 移除前後空白，限制長度
-        sanitized = name.strip()[:100]
-        
-        # 移除不允許的字符（如果有的話）
-        # Notion multi-select 選項名稱相對寬鬆，但仍需避免某些特殊字符
-        sanitized = sanitized.replace('\n', ' ').replace('\r', ' ')
-        
-        return sanitized if sanitized else "未命名選項"
-    
-    async def _create_page_with_retry(self, properties: Dict, children: List[Dict], max_retries: int = 3) -> Optional[Dict]:
-        """帶重試機制的頁面創建"""
-        for attempt in range(max_retries):
             try:
-                response = await self.client.pages.create(
-                    parent={"database_id": self.database_id},
-                    properties=properties,
-                    children=children
+                self.r2_client = boto3.client(
+                    's3',
+                    endpoint_url=f"https://{r2_config['account_id']}.r2.cloudflarestorage.com",
+                    aws_access_key_id=r2_config['access_key'],
+                    aws_secret_access_key=r2_config['secret_key'],
+                    region_name='auto'
                 )
-                return response
-                
-            except RequestTimeoutError:
-                logger.warning(f"⏱️ 請求超時，嘗試重試 ({attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(2 ** attempt)  # 指數退避
-                    
-            except APIError as e:
-                if e.status == 429:  # Rate limit
-                    logger.warning(f"📊 API 速率限制，等待後重試 ({attempt + 1}/{max_retries})")
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(5 * (attempt + 1))
-                else:
-                    logger.error(f"❌ Notion API 錯誤 (狀態碼: {e.status})：{str(e)}")
-                    break
-                    
+                self.r2_enabled = True
+                logger.info("✅ R2 客戶端初始化成功")
             except Exception as e:
-                logger.error(f"❌ 創建頁面時發生未預期錯誤：{str(e)}")
-                break
+                logger.error(f"❌ R2 客戶端初始化失敗: {e}")
+                self.r2_client = None
+                self.r2_enabled = False
+
+    def _download_video(self) -> Tuple[str, Optional[str]]:
+        """下載影片和縮圖，返回檔案路徑"""
+        logger.info(f"📥 開始下載影片: {self.task.original_link}")
+        output_path = os.path.join(self.temp_dir, f"{self.task.task_id}_video")
         
-        return None
-    
-    def _create_page_content(self, task_data: Dict, ai_content: Dict) -> List[Dict]:
-        """創建頁面內容 - 優化版"""
-        blocks = []
-        
-        # 主標題
-        task_name = task_data.get("task_name", "影片分析")
-        blocks.append({
-            "object": "block",
-            "type": "heading_1",
-            "heading_1": {
-                "rich_text": [{"text": {"content": f"🎬 {task_name}"}}]
-            }
-        })
-        
-        # 處理狀態卡片
-        status_text = f"✅ AI 處理完成\n📅 處理時間：{datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        blocks.append({
-            "object": "block",
-            "type": "callout",
-            "callout": {
-                "rich_text": [{"text": {"content": status_text}}],
-                "icon": {"emoji": "✅"},
-                "color": "green_background"
-            }
-        })
-        
-        # 基本資訊區塊
-        self._add_basic_info_blocks(blocks, task_data)
-        
-        # AI 分析結果
-        self._add_ai_analysis_blocks(blocks, ai_content)
-        
-        # 原始連結
-        self._add_original_link_block(blocks, task_data)
-        
-        return blocks
-    
-    def _add_basic_info_blocks(self, blocks: List[Dict], task_data: Dict) -> None:
-        """添加基本資訊區塊"""
-        info_items = []
-        
-        if task_data.get("assignee"):
-            info_items.append(f"👤 負責人：{task_data['assignee']}")
-        if task_data.get("photographer"):
-            info_items.append(f"📸 攝影師：{task_data['photographer']}")
-        
-        if info_items:
-            blocks.extend([
-                {
-                    "object": "block",
-                    "type": "heading_2",
-                    "heading_2": {"rich_text": [{"text": {"content": "📋 基本資訊"}}]}
-                },
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {"rich_text": [{"text": {"content": "\n".join(info_items)}}]}
-                }
-            ])
-    
-    def _add_ai_analysis_blocks(self, blocks: List[Dict], ai_content: Dict) -> None:
-        """添加 AI 分析結果區塊"""
-        if not ai_content:
-            return
-        
-        blocks.append({
-            "object": "block",
-            "type": "heading_2",
-            "heading_2": {"rich_text": [{"text": {"content": "🤖 AI 分析結果"}}]}
-        })
-        
-        # 內容摘要
-        if ai_content.get("summary"):
-            blocks.extend([
-                {
-                    "object": "block",
-                    "type": "heading_3",
-                    "heading_3": {"rich_text": [{"text": {"content": "📝 內容摘要"}}]}
-                },
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {"rich_text": [{"text": {"content": ai_content["summary"]}}]}
-                }
-            ])
-        
-        # 建議標題列表
-        if ai_content.get("titles"):
-            blocks.append({
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {"rich_text": [{"text": {"content": "💡 建議標題"}}]}
-            })
-            
-            for i, title in enumerate(ai_content["titles"][:5], 1):
-                blocks.append({
-                    "object": "block",
-                    "type": "numbered_list_item",
-                    "numbered_list_item": {
-                        "rich_text": [{"text": {"content": title}}]
-                    }
-                })
-        
-        # 建議標籤
-        if ai_content.get("tags"):
-            tags_text = " • ".join(f"#{tag}" for tag in ai_content["tags"][:10])
-            blocks.extend([
-                {
-                    "object": "block",
-                    "type": "heading_3",
-                    "heading_3": {"rich_text": [{"text": {"content": "🏷️ 建議標籤"}}]}
-                },
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {"rich_text": [{"text": {"content": tags_text}}]}
-                }
-            ])
-    
-    def _add_original_link_block(self, blocks: List[Dict], task_data: Dict) -> None:
-        """添加原始連結區塊"""
-        if not task_data.get("video_url"):
-            return
-        
-        blocks.extend([
-            {
-                "object": "block",
-                "type": "divider",
-                "divider": {}
-            },
-            {
-                "object": "block",
-                "type": "heading_3",
-                "heading_3": {"rich_text": [{"text": {"content": "🔗 原始影片"}}]}
-            },
-            {
-                "object": "block",
-                "type": "bookmark",
-                "bookmark": {"url": task_data.get("video_url")}
-            }
-        ])
-    
-    async def update_page_status(self, page_id: str, status: str, additional_properties: Optional[Dict] = None) -> bool:
-        """更新頁面狀態"""
-        if not self.enabled or not page_id:
-            return False
+        ydl_opts = {
+            'format': 'best[height<=1080]/best', 
+            'outtmpl': f'{output_path}.%(ext)s', 
+            'writethumbnail': True,
+            'writeinfojson': False,
+            'writesubtitles': False,
+            'quiet': False,
+            'no_warnings': False,
+        }
         
         try:
-            properties = {
-                "狀態": {"select": {"name": status}}
-            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(self.task.original_link, download=True)
+                logger.info(f"📺 影片資訊: {info.get('title', 'Unknown')} - {info.get('duration', 'Unknown')}秒")
+        except Exception as e:
+            logger.error(f"❌ 影片下載失敗: {e}")
+            raise RuntimeError(f"影片下載失敗: {str(e)}")
+        
+        # 尋找下載的檔案
+        video_files = list(Path(self.temp_dir).glob(f"{self.task.task_id}_video.*"))
+        video_file = next((str(f) for f in video_files if f.suffix not in ['.webp', '.jpg', '.png']), None)
+        thumbnail_file = next((str(f) for f in video_files if f.suffix in ['.webp', '.jpg', '.png']), None)
+        
+        if not video_file:
+            raise FileNotFoundError("❌ 影片檔案未找到，下載可能失敗")
+        
+        video_size = os.path.getsize(video_file) / (1024 * 1024)  # MB
+        logger.info(f"✅ 影片下載完成: {Path(video_file).name} ({video_size:.1f}MB)")
+        if thumbnail_file:
+            logger.info(f"🖼️ 縮圖下載完成: {Path(thumbnail_file).name}")
+        
+        return video_file, thumbnail_file
+
+    def _upload_to_r2(self, local_path: str, file_type: str) -> str:
+        """上傳單一檔案到 R2，返回公開 URL"""
+        if not self.r2_enabled:
+            logger.info(f"💾 {file_type} 保存在本地: {local_path}")
+            return f"local://{local_path}"
+        
+        bucket = os.getenv('R2_BUCKET')
+        timestamp_path = datetime.now().strftime("%Y/%m/%d")
+        file_ext = Path(local_path).suffix
+        r2_key = f"{file_type}/{timestamp_path}/{self.task.task_id}{file_ext}"
+        
+        content_type_map = {
+            '.mp4': 'video/mp4', 
+            '.webm': 'video/webm',
+            '.jpg': 'image/jpeg', 
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png', 
+            '.webp': 'image/webp'
+        }
+        content_type = content_type_map.get(file_ext.lower(), 'application/octet-stream')
+        
+        try:
+            file_size = os.path.getsize(local_path) / (1024 * 1024)  # MB
+            logger.info(f"☁️ 開始上傳 {file_type}: {Path(local_path).name} ({file_size:.1f}MB)")
             
-            if additional_properties:
-                properties.update(additional_properties)
-            
-            await self.client.pages.update(
-                page_id=page_id,
-                properties=properties
+            self.r2_client.upload_file(
+                local_path, 
+                bucket, 
+                r2_key, 
+                ExtraArgs={
+                    'ContentType': content_type,
+                    'CacheControl': 'public, max-age=31536000',  # 1年快取
+                }
             )
             
-            logger.info(f"✅ 更新 Notion 頁面狀態：{status}")
-            return True
+            # 組成公開 URL
+            r2_public_domain = os.getenv('R2_CUSTOM_DOMAIN')
+            if r2_public_domain:
+                url = f"https://{r2_public_domain}/{r2_key}"
+            else:
+                url = f"https://pub-{os.getenv('R2_ACCOUNT_ID')}.r2.dev/{r2_key}"
+            
+            logger.info(f"✅ {file_type} 上傳完成: {url}")
+            return url
             
         except Exception as e:
-            logger.error(f"❌ 更新頁面狀態失敗：{str(e)}")
-            return False
-    
-    async def get_page_info(self, page_id: str) -> Optional[Dict]:
-        """獲取頁面資訊"""
-        if not self.enabled or not page_id:
-            return None
+            logger.error(f"❌ {file_type} 上傳失敗: {e}")
+            return f"upload_failed://{local_path}"
+
+    def _generate_ai_content(self):
+        """呼叫 AI 生成內容，並更新 task 物件"""
+        logger.info("🤖 開始 AI 內容生成...")
+        
+        prompt = f"""
+        請分析以下影片任務，並以台灣社群媒體風格提供內容建議。
+        
+        任務資訊：
+        - 任務名稱: {self.task.task_name}
+        - 負責人: {self.task.person_in_charge}
+        - 攝影師: {self.task.videographer}
+        
+        請嚴格按照以下 JSON 格式回覆，不要有任何額外的文字或解釋：
+        {{
+          "AI標題建議": ["吸引人的標題1", "有趣的標題2", "病毒式標題3", "創意標題4", "熱門標題5"],
+          "內容摘要": "一段約80-120字的影片內容摘要，要能引起觀看興趣，突出影片亮點。",
+          "標籤建議": ["#相關標籤1", "#熱門標籤2", "#台灣", "#影片", "#創作", "#生活", "#有趣", "#推薦"]
+        }}
+        
+        請確保標題具有吸引力且適合台灣觀眾，標籤要包含相關且熱門的關鍵字。
+        """
         
         try:
-            response = await self.client.pages.retrieve(page_id=page_id)
-            return {
-                "id": response["id"],
-                "url": response["url"],
-                "created_time": response["created_time"],
-                "last_edited_time": response["last_edited_time"],
-                "properties": response.get("properties", {})
-            }
+            response = self.openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                response_format={"type": "json_object"},
+                messages=[
+                    {
+                        "role": "system", 
+                        "content": "你是一位專業的台灣短影音行銷專家，擅長創造吸引人的標題、摘要和標籤。你了解台灣網路文化和流行趨勢。"
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.8,
+                max_tokens=1500,
+                top_p=0.9
+            )
+            
+            ai_content = response.choices[0].message.content
+            logger.info(f"🤖 AI 原始回應長度: {len(ai_content)} 字元")
+            
+            ai_data = json.loads(ai_content)
+            
+            # 驗證和清理 AI 回應
+            self.task.ai_title_suggestions = ai_data.get("AI標題建議", [])[:5]  # 最多5個標題
+            self.task.ai_content_summary = ai_data.get("內容摘要", "")[:500]    # 限制摘要長度
+            self.task.ai_tag_suggestions = ai_data.get("標籤建議", [])[:10]     # 最多10個標籤
+            
+            # 記錄生成結果
+            logger.info(f"✅ AI 內容生成成功:")
+            logger.info(f"   📝 標題數量: {len(self.task.ai_title_suggestions)}")
+            logger.info(f"   📄 摘要長度: {len(self.task.ai_content_summary)} 字元")
+            logger.info(f"   🏷️ 標籤數量: {len(self.task.ai_tag_suggestions)}")
+            
+            # 顯示生成的內容
+            if self.task.ai_title_suggestions:
+                logger.info("💡 建議標題:")
+                for i, title in enumerate(self.task.ai_title_suggestions, 1):
+                    logger.info(f"   {i}. {title}")
+            
+            if self.task.ai_tag_suggestions:
+                logger.info(f"🏷️ 建議標籤: {' '.join(self.task.ai_tag_suggestions)}")
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ AI 回應 JSON 解析失敗: {e}")
+            logger.error(f"原始回應: {ai_content[:200]}...")
+            self.task.error_message = "AI 回應格式錯誤"
         except Exception as e:
-            logger.error(f"❌ 獲取頁面資訊失敗：{str(e)}")
-            return None
+            logger.error(f"❌ AI 內容生成失敗: {e}")
+            self.task.error_message = f"AI 服務錯誤: {str(e)}"
 
+    def _cleanup(self):
+        """清理臨時資料夾"""
+        try:
+            import shutil
+            shutil.rmtree(self.temp_dir)
+            logger.info("🧹 臨時檔案清理完成")
+        except Exception as e:
+            logger.warning(f"⚠️ 臨時檔案清理失敗: {e}")
 
-# 向後相容性別名
-NotionHandler = NotionVideoProcessor
+    def process(self) -> Dict[str, Any]:
+        """執行完整的處理流程"""
+        start_time = datetime.now()
+        logger.info("="*60)
+        logger.info(f"🚀 開始執行影片處理流程")
+        logger.info(f"📋 任務 ID: {self.task.task_id}")
+        logger.info(f"🎬 任務名稱: {self.task.task_name}")
+        logger.info("="*60)
+        
+        try:
+            # 步驟 1: 下載影片和縮圖
+            logger.info("📥 步驟 1/3: 下載影片")
+            video_path, thumb_path = self._download_video()
+            
+            # 步驟 2: 上傳到 R2（如果啟用）
+            logger.info("☁️ 步驟 2/3: 上傳檔案")
+            self.task.processed_video_url = self._upload_to_r2(video_path, "videos")
+            if thumb_path:
+                self.task.processed_thumbnail_url = self._upload_to_r2(thumb_path, "thumbnails")
+            
+            # 步驟 3: AI 分析
+            logger.info("🤖 步驟 3/3: AI 內容生成")
+            self._generate_ai_content()
+            
+            # 更新最終狀態
+            if not self.task.error_message:
+                self.task.status = "完成"
+                logger.info("🎉 影片處理流程完全成功")
+            else:
+                self.task.status = "部分完成"
+                logger.warning(f"⚠️ 處理完成但有錯誤: {self.task.error_message}")
+
+        except Exception as e:
+            logger.error("❌ 處理過程中發生致命錯誤")
+            logger.error(f"錯誤詳情: {str(e)}")
+            logger.error(f"錯誤類型: {type(e).__name__}")
+            
+            self.task.status = "失敗"
+            self.task.error_message = str(e)
+        
+        finally:
+            # 計算處理時間
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+            
+            # 清理臨時檔案
+            self._cleanup()
+            
+            # 輸出最終結果
+            logger.info("="*60)
+            logger.info("📊 處理結果摘要")
+            logger.info("="*60)
+            logger.info(f"⏱️ 總處理時間: {duration:.1f} 秒")
+            logger.info(f"📄 任務 ID: {self.task.task_id}")
+            logger.info(f"✅ 最終狀態: {self.task.status}")
+            
+            if self.task.processed_video_url:
+                logger.info(f"🎥 影片連結: {self.task.processed_video_url}")
+            if self.task.processed_thumbnail_url:
+                logger.info(f"🖼️ 縮圖連結: {self.task.processed_thumbnail_url}")
+            
+            logger.info("="*60)
+            
+            return asdict(self.task)
