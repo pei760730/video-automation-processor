@@ -1,5 +1,5 @@
-# .github/workflows/process-video.yml - v4.2 (修正版)
-name: Process Video from Notion Trigger
+# .github/workflows/process_video.yml - v2.3 優化版
+name: Enhanced Video Processing with Whisper
 
 on:
   repository_dispatch:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       notion_page_id:
-        description: '要處理的 Notion Page ID'
+        description: 'Notion 頁面 ID'
         required: true
         type: string
       original_link:
@@ -27,6 +27,16 @@ on:
         description: '攝影師'
         required: false
         type: string
+      enable_whisper:
+        description: '啟用 Whisper 語音轉文字'
+        required: false
+        type: boolean
+        default: true
+      enable_local_backup:
+        description: '啟用本地備份'
+        required: false
+        type: boolean
+        default: true
 
 # 設定並行控制
 concurrency:
@@ -36,7 +46,7 @@ concurrency:
 jobs:
   process-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45  # 增加時間以支援 Whisper
     
     steps:
       # 步驟 1: 拉取程式碼
@@ -56,7 +66,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg libgl1-mesa-glx libglib2.0-0
           
           # 安裝 yt-dlp
           sudo wget -q https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
@@ -89,17 +99,26 @@ jobs:
           echo "📋 任務資訊:"
           echo "  - Notion Page ID: ${{ github.event.client_payload.notion_page_id || github.event.inputs.notion_page_id }}"
           echo "  - 任務名稱: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}"
+          echo "  - 影片連結: ${{ github.event.client_payload.original_link || github.event.inputs.original_link }}"
           echo "  - 負責人: ${{ github.event.client_payload.person_in_charge || github.event.inputs.person_in_charge || '未指定' }}"
           echo "  - 攝影師: ${{ github.event.client_payload.videographer || github.event.inputs.videographer || '未指定' }}"
+          echo "  - Whisper 啟用: ${{ github.event.client_payload.enable_whisper || github.event.inputs.enable_whisper || 'true' }}"
       
-      # 步驟 6: 執行影片處理
-      - name: Run Video Processor
+      # 步驟 6: 建立 downloads 目錄
+      - name: Create downloads directory
+        run: |
+          mkdir -p downloads
+          echo "📁 建立 downloads 目錄完成"
+      
+      # 步驟 7: 執行增強版影片處理
+      - name: Run Enhanced Video Processor
         id: run-processor
-        timeout-minutes: 20
+        timeout-minutes: 35
         env:
           # Python 環境設定
           PYTHONPATH: .
           PYTHONUNBUFFERED: 1
+          PYTHONDONTWRITEBYTECODE: 1
           
           # API Keys
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -108,7 +127,7 @@ jobs:
           NOTION_API_KEY: ${{ secrets.NOTION_API_KEY }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           
-          # R2 儲存設定 (修正變數名稱對應)
+          # R2 儲存設定 (可選，失敗會自動備份到本地)
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
           R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
@@ -121,8 +140,14 @@ jobs:
           TASK_NAME: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}
           PERSON_IN_CHARGE: ${{ github.event.client_payload.person_in_charge || github.event.inputs.person_in_charge || '' }}
           VIDEOGRAPHER: ${{ github.event.client_payload.videographer || github.event.inputs.videographer || '' }}
+          
+          # 增強功能開關
+          ENABLE_WHISPER: ${{ github.event.client_payload.enable_whisper || github.event.inputs.enable_whisper || 'true' }}
+          ENABLE_LOCAL_BACKUP: ${{ github.event.client_payload.enable_local_backup || github.event.inputs.enable_local_backup || 'true' }}
+          EXTRACT_FRAME: ${{ github.event.client_payload.extract_frame || github.event.inputs.extract_frame || 'true' }}
+          
         run: |
-          echo "🏃‍♂️ 開始影片處理..."
+          echo "🏃‍♂️ 開始增強版影片處理..."
           echo "⏰ 開始時間: $(date)"
           
           # 執行主程式
@@ -139,41 +164,46 @@ jobs:
             exit $EXIT_CODE
           fi
       
-      # 步驟 7: 清理暫存檔案
+      # 步驟 8: 上傳處理結果 (downloads 資料夾)
+      - name: Upload processed files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-video-${{ github.run_id }}
+          path: |
+            downloads/
+            logs/
+          retention-days: 30
+          if-no-files-found: warn
+      
+      # 步驟 9: 清理暫存檔案
       - name: Clean up temporary files
         if: always()
         continue-on-error: true
         run: |
           echo "🧹 清理暫存檔案..."
           
-          # 清理可能的暫存檔案
+          # 清理 Python 快取
+          find . -type d -name "__pycache__" -delete 2>/dev/null || true
+          find . -name "*.pyc" -delete 2>/dev/null || true
+          
+          # 清理暫存檔案
           find . -name "*.tmp" -type f -delete 2>/dev/null || true
           find . -name "*.part" -type f -delete 2>/dev/null || true
           find . -name "video_pipeline_*" -type d -exec rm -rf {} + 2>/dev/null || true
           
-          # 清理大型影片檔案
-          find . -name "*.mp4" -type f -size +50M -delete 2>/dev/null || true
-          find . -name "*.webm" -type f -size +50M -delete 2>/dev/null || true
-          
           echo "✅ 清理完成"
       
-      # 步驟 8: 上傳失敗日誌
+      # 步驟 10: 上傳失敗日誌
       - name: Upload failure logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: failure-logs-${{ github.run_id }}
           path: |
+            logs/
             *.log
             *.txt
             !requirements.txt
           retention-days: 7
           if-no-files-found: warn
-      
-      # 步驟 9: 發送失敗通知
-      - name: Send notification on failure
-        if: failure() && github.event_name == 'repository_dispatch'
-        continue-on-error: true
-        run: |
-          echo "📧 發送失敗通知..."
-          echo "⚠️ 影片處理失敗 - 任務: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}"
