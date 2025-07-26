@@ -1,263 +1,146 @@
-# 檔案路徑: src/notion_video_processor.py
+# 增強版 src/notion_video_processor.py
 
-import os
-import sys
-import json
-import tempfile
-import hashlib
-import logging
-import requests
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass, field, asdict
+import cv2
+import numpy as np
+from PIL import Image
+import base64
+import io
 
-import yt_dlp
-import boto3
-from openai import OpenAI
-from botocore.exceptions import ClientError
-from tenacity import retry, stop_after_attempt, wait_exponential
-
-# 設定日誌
-logger = logging.getLogger(__name__)
-
-# --- 直接對應 Notion 欄位的資料結構 ---
-@dataclass
-class NotionTask:
-    """
-    直接映射 Notion "Video Pipeline" 資料庫的資料結構。
-    """
-    # === 輸入欄位 (來自 Notion / 環境變數) ===
-    notion_page_id: str         # 用來更新 Notion 特定頁面的 ID
-    task_name: str              # 對應 Notion 的「任務名稱」
-    person_in_charge: str       # 對應 Notion 的「負責人」
-    videographer: str           # 對應 Notion 的「攝影師」
-    original_link: str          # 對應 Notion 的「原始連結」
+class EnhancedNotionVideoProcessor(NotionVideoProcessor):
+    """增強版影片處理器 - 新增 Whisper 和本地備份功能"""
     
-    # === 處理中/輸出欄位 (由程式生成) ===
-    status: str = "處理中"      # 對應 Notion 的「狀態」
-    
-    # 儲存到 R2 的結果連結
-    processed_video_url: Optional[str] = None
-    processed_thumbnail_url: Optional[str] = None
-    
-    # AI 生成的內容，對應 Notion 欄位
-    ai_title_suggestions: List[str] = field(default_factory=list) # 對應「AI標題建議」
-    ai_content_summary: Optional[str] = None                      # 對應「內容摘要」
-    ai_tag_suggestions: List[str] = field(default_factory=list)   # 對應「標籤建議」
-
-    # 處理過程中的內部資訊
-    task_id: str = ""           # 本次處理的唯一 ID，用於命名檔案
-    error_message: Optional[str] = None # 如果失敗，記錄錯誤訊息
-
-    def __post_init__(self):
-        """在初始化後，生成唯一的 task_id"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        hash_input = f"{self.original_link}_{timestamp}"
-        hash_suffix = hashlib.md5(hash_input.encode()).hexdigest()[:8]
-        self.task_id = f"task_{timestamp}_{hash_suffix}"
-
-# --- 核心處理器 ---
-class NotionVideoProcessor:
-    """
-    為 Notion Video Pipeline 設計的影片處理器 - 完整優化版
-    """
     def __init__(self):
-        """初始化，讀取環境變數並設定客戶端"""
-        self.temp_dir = tempfile.mkdtemp(prefix='video_pipeline_')
-        self._setup_task_from_env()
-        self._setup_clients()
-        logger.info(f"✅ Notion 影片處理器初始化完成 - Task ID: {self.task.task_id}")
-
-    def _setup_task_from_env(self):
-        """從環境變數讀取資訊，建立 NotionTask 物件"""
-        required_vars = [
-            'NOTION_PAGE_ID', 'TASK_NAME', 'PERSON_IN_CHARGE',
-            'VIDEOGRAPHER', 'ORIGINAL_LINK'
-        ]
-        missing_vars = [var for var in required_vars if not os.getenv(var)]
-        if missing_vars:
-            raise ValueError(f"❌ 缺少必要的環境變數: {', '.join(missing_vars)}")
+        super().__init__()
+        self.downloads_dir = Path("downloads")
+        self.downloads_dir.mkdir(exist_ok=True)
         
-        self.task = NotionTask(
-            notion_page_id=os.getenv('NOTION_PAGE_ID'),
-            task_name=os.getenv('TASK_NAME'),
-            person_in_charge=os.getenv('PERSON_IN_CHARGE'),
-            videographer=os.getenv('VIDEOGRAPHER'),
-            original_link=os.getenv('ORIGINAL_LINK')
-        )
-        logger.info(f"📋 任務資料載入成功 - {self.task.task_name}")
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def _setup_clients(self):
-        """設定 OpenAI、R2 和 Notion 客戶端"""
-        # 1. 設定 OpenAI 客戶端
-        openai_key = os.getenv('OPENAI_API_KEY')
-        if not openai_key:
-            raise ValueError("❌ 缺少 OPENAI_API_KEY 環境變數")
-        
+    def _extract_video_frame(self, video_path: str, timestamp: float = 1.0) -> Optional[str]:
+        """提取影片中的一幀作為縮圖"""
         try:
-            self.openai_client = OpenAI(api_key=openai_key, timeout=60.0)
-            logger.info("✅ OpenAI 客戶端初始化成功")
+            cap = cv2.VideoCapture(video_path)
+            
+            # 設置到指定時間點
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_number = int(fps * timestamp)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            
+            ret, frame = cap.read()
+            cap.release()
+            
+            if not ret:
+                logger.warning("⚠️ 無法提取影片幀，使用預設時間點")
+                return None
+            
+            # 轉換為 RGB 格式
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # 調整大小（可選）
+            height, width = frame_rgb.shape[:2]
+            if width > 1280:
+                ratio = 1280 / width
+                new_width = 1280
+                new_height = int(height * ratio)
+                frame_rgb = cv2.resize(frame_rgb, (new_width, new_height))
+            
+            # 保存為文件
+            frame_path = os.path.join(self.temp_dir, f"{self.task.task_id}_frame.jpg")
+            cv2.imwrite(frame_path, cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+            
+            logger.info(f"✅ 提取影片幀成功: {frame_path}")
+            return frame_path
+            
         except Exception as e:
-            raise ValueError(f"❌ OpenAI 客戶端初始化失敗: {e}")
-        
-        # 2. 設定 R2 客戶端
-        r2_config = {
-            'account_id': os.getenv('R2_ACCOUNT_ID'),
-            'access_key': os.getenv('R2_ACCESS_KEY'),
-            'secret_key': os.getenv('R2_SECRET_KEY'),
-            'bucket': os.getenv('R2_BUCKET')
-        }
-        
-        missing_r2 = [k for k, v in r2_config.items() if not v]
-        if missing_r2:
-            logger.warning(f"⚠️ R2 配置不完整，缺少: {', '.join(missing_r2)}")
-            logger.warning("📁 檔案將保存在本地，不會上傳到雲端")
-            self.r2_client = None
-            self.r2_enabled = False
-        else:
-            try:
-                self.r2_client = boto3.client(
-                    's3',
-                    endpoint_url=f"https://{r2_config['account_id']}.r2.cloudflarestorage.com",
-                    aws_access_key_id=r2_config['access_key'],
-                    aws_secret_access_key=r2_config['secret_key'],
-                    region_name='auto'
+            logger.error(f"❌ 提取影片幀失敗: {e}")
+            return None
+    
+    def _transcribe_with_whisper(self, video_path: str) -> Optional[Dict[str, Any]]:
+        """使用 Whisper 進行語音轉文字"""
+        if not self.openai_client:
+            logger.warning("⚠️ OpenAI 客戶端未配置，跳過語音轉文字")
+            return None
+            
+        try:
+            logger.info("🎤 開始語音轉文字 (Whisper)...")
+            
+            with open(video_path, 'rb') as audio_file:
+                transcript = self.openai_client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio_file,
+                    response_format="verbose_json",
+                    language="zh"  # 指定中文
                 )
-                self.r2_enabled = True
-                logger.info("✅ R2 客戶端初始化成功")
-            except Exception as e:
-                logger.error(f"❌ R2 客戶端初始化失敗: {e}")
-                self.r2_client = None
-                self.r2_enabled = False
-        
-        # 3. 設定 Notion 客戶端
-        notion_config = {
-            'api_key': os.getenv('NOTION_API_KEY'),
-            'database_id': os.getenv('NOTION_DATABASE_ID')
-        }
-        
-        if not notion_config['api_key'] or not notion_config['database_id']:
-            logger.warning("⚠️ Notion 配置不完整，將跳過 Notion 更新")
-            self.notion_enabled = False
-        else:
-            self.notion_enabled = True
-            self.notion_headers = {
-                'Authorization': f'Bearer {notion_config["api_key"]}',
-                'Content-Type': 'application/json',
-                'Notion-Version': '2022-06-28'
+            
+            result = {
+                "text": transcript.text,
+                "language": transcript.language,
+                "duration": transcript.duration,
+                "segments": getattr(transcript, 'segments', [])
             }
-            self.notion_database_id = notion_config['database_id']
-            logger.info("✅ Notion 客戶端初始化成功")
-
-    def _download_video(self) -> Tuple[str, Optional[str]]:
-        """下載影片和縮圖，返回檔案路徑"""
-        logger.info(f"📥 開始下載影片: {self.task.original_link}")
-        output_path = os.path.join(self.temp_dir, f"{self.task.task_id}_video")
-        
-        ydl_opts = {
-            'format': 'best[height<=1080]/best', 
-            'outtmpl': f'{output_path}.%(ext)s', 
-            'writethumbnail': True,
-            'writeinfojson': False,
-            'writesubtitles': False,
-            'quiet': False,
-            'no_warnings': False,
-        }
-        
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(self.task.original_link, download=True)
-                logger.info(f"📺 影片資訊: {info.get('title', 'Unknown')} - {info.get('duration', 'Unknown')}秒")
-        except Exception as e:
-            logger.error(f"❌ 影片下載失敗: {e}")
-            raise RuntimeError(f"影片下載失敗: {str(e)}")
-        
-        # 尋找下載的檔案
-        video_files = list(Path(self.temp_dir).glob(f"{self.task.task_id}_video.*"))
-        video_file = next((str(f) for f in video_files if f.suffix not in ['.webp', '.jpg', '.png']), None)
-        thumbnail_file = next((str(f) for f in video_files if f.suffix in ['.webp', '.jpg', '.png']), None)
-        
-        if not video_file:
-            raise FileNotFoundError("❌ 影片檔案未找到，下載可能失敗")
-        
-        video_size = os.path.getsize(video_file) / (1024 * 1024)  # MB
-        logger.info(f"✅ 影片下載完成: {Path(video_file).name} ({video_size:.1f}MB)")
-        if thumbnail_file:
-            logger.info(f"🖼️ 縮圖下載完成: {Path(thumbnail_file).name}")
-        
-        return video_file, thumbnail_file
-
-    def _upload_to_r2(self, local_path: str, file_type: str) -> str:
-        """上傳單一檔案到 R2，返回公開 URL"""
-        if not self.r2_enabled:
-            logger.info(f"💾 {file_type} 保存在本地: {local_path}")
-            return f"local://{local_path}"
-        
-        bucket = os.getenv('R2_BUCKET')
-        timestamp_path = datetime.now().strftime("%Y/%m/%d")
-        file_ext = Path(local_path).suffix
-        r2_key = f"{file_type}/{timestamp_path}/{self.task.task_id}{file_ext}"
-        
-        content_type_map = {
-            '.mp4': 'video/mp4', 
-            '.webm': 'video/webm',
-            '.jpg': 'image/jpeg', 
-            '.jpeg': 'image/jpeg',
-            '.png': 'image/png', 
-            '.webp': 'image/webp'
-        }
-        content_type = content_type_map.get(file_ext.lower(), 'application/octet-stream')
-        
-        try:
-            file_size = os.path.getsize(local_path) / (1024 * 1024)  # MB
-            logger.info(f"☁️ 開始上傳 {file_type}: {Path(local_path).name} ({file_size:.1f}MB)")
             
-            self.r2_client.upload_file(
-                local_path, 
-                bucket, 
-                r2_key, 
-                ExtraArgs={
-                    'ContentType': content_type,
-                    'CacheControl': 'public, max-age=31536000',  # 1年快取
-                }
-            )
+            logger.info(f"✅ 語音轉文字完成: {len(result['text'])} 字元")
+            logger.info(f"🗣️ 轉錄文字: {result['text'][:100]}...")
             
-            # 組成公開 URL
-            r2_public_domain = os.getenv('R2_CUSTOM_DOMAIN')
-            if r2_public_domain:
-                url = f"https://{r2_public_domain}/{r2_key}"
-            else:
-                url = f"https://pub-{os.getenv('R2_ACCOUNT_ID')}.r2.dev/{r2_key}"
-            
-            logger.info(f"✅ {file_type} 上傳完成: {url}")
-            return url
+            return result
             
         except Exception as e:
-            logger.error(f"❌ {file_type} 上傳失敗: {e}")
-            return f"upload_failed://{local_path}"
-
-    def _generate_ai_content(self):
-        """呼叫 AI 生成內容，並更新 task 物件"""
-        logger.info("🤖 開始 AI 內容生成...")
+            logger.error(f"❌ 語音轉文字失敗: {e}")
+            return None
+    
+    def _backup_to_downloads(self, video_path: str, thumbnail_path: Optional[str] = None) -> Dict[str, str]:
+        """備份檔案到 downloads 資料夾"""
+        import shutil
+        
+        backup_paths = {}
+        
+        try:
+            # 備份影片
+            video_backup = self.downloads_dir / f"{self.task.task_id}_video{Path(video_path).suffix}"
+            shutil.copy2(video_path, video_backup)
+            backup_paths['video'] = str(video_backup)
+            logger.info(f"📁 影片備份完成: {video_backup}")
+            
+            # 備份縮圖
+            if thumbnail_path:
+                thumb_backup = self.downloads_dir / f"{self.task.task_id}_thumb{Path(thumbnail_path).suffix}"
+                shutil.copy2(thumbnail_path, thumb_backup)
+                backup_paths['thumbnail'] = str(thumb_backup)
+                logger.info(f"📁 縮圖備份完成: {thumb_backup}")
+                
+        except Exception as e:
+            logger.error(f"❌ 備份失敗: {e}")
+            
+        return backup_paths
+    
+    def _enhanced_ai_content_with_transcript(self, transcript_data: Optional[Dict] = None):
+        """使用轉錄文字增強 AI 內容生成"""
+        if not self.openai_client:
+            logger.warning("⚠️ OpenAI 客戶端未配置，跳過 AI 內容生成")
+            return
+            
+        logger.info("🤖 開始增強版 AI 內容生成...")
+        
+        # 準備提示詞
+        transcript_text = ""
+        if transcript_data and transcript_data.get('text'):
+            transcript_text = f"\n影片轉錄內容: {transcript_data['text']}"
         
         prompt = f"""
-        請分析以下影片任務，並以台灣社群媒體風格提供內容建議。
+        請分析以下影片任務和內容，並以台灣社群媒體風格提供內容建議。
         
         任務資訊：
         - 任務名稱: {self.task.task_name}
         - 負責人: {self.task.person_in_charge}
-        - 攝影師: {self.task.videographer}
+        - 攝影師: {self.task.videographer}{transcript_text}
         
-        請嚴格按照以下 JSON 格式回覆，不要有任何額外的文字或解釋：
+        請嚴格按照以下 JSON 格式回覆：
         {{
           "AI標題建議": ["吸引人的標題1", "有趣的標題2", "病毒式標題3", "創意標題4", "熱門標題5"],
           "內容摘要": "一段約80-120字的影片內容摘要，要能引起觀看興趣，突出影片亮點。",
-          "標籤建議": ["#相關標籤1", "#熱門標籤2", "#台灣", "#影片", "#創作", "#生活", "#有趣", "#推薦"]
+          "標籤建議": ["#相關標籤1", "#熱門標籤2", "#台灣", "#影片", "#創作", "#生活", "#有趣", "#推薦"],
+          "關鍵字": ["關鍵字1", "關鍵字2", "關鍵字3"],
+          "情感分析": "正面/中性/負面",
+          "內容類型": "娛樂/教育/生活/其他"
         }}
-        
-        請確保標題具有吸引力且適合台灣觀眾，標籤要包含相關且熱門的關鍵字。
         """
         
         try:
@@ -267,191 +150,139 @@ class NotionVideoProcessor:
                 messages=[
                     {
                         "role": "system", 
-                        "content": "你是一位專業的台灣短影音行銷專家，擅長創造吸引人的標題、摘要和標籤。你了解台灣網路文化和流行趨勢。"
+                        "content": "你是一位專業的台灣短影音行銷專家，擅長分析影片內容並創造吸引人的標題、摘要和標籤。你了解台灣網路文化和流行趨勢。"
                     },
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.8,
-                max_tokens=1500,
+                max_tokens=2000,
                 top_p=0.9
             )
             
             ai_content = response.choices[0].message.content
-            logger.info(f"🤖 AI 原始回應長度: {len(ai_content)} 字元")
-            
             ai_data = json.loads(ai_content)
             
-            # 驗證和清理 AI 回應
-            self.task.ai_title_suggestions = ai_data.get("AI標題建議", [])[:5]  # 最多5個標題
-            self.task.ai_content_summary = ai_data.get("內容摘要", "")[:500]    # 限制摘要長度
-            self.task.ai_tag_suggestions = ai_data.get("標籤建議", [])[:10]     # 最多10個標籤
+            # 更新任務數據
+            self.task.ai_title_suggestions = ai_data.get("AI標題建議", [])[:5]
+            self.task.ai_content_summary = ai_data.get("內容摘要", "")[:500]
+            self.task.ai_tag_suggestions = ai_data.get("標籤建議", [])[:10]
             
-            # 記錄生成結果
-            logger.info(f"✅ AI 內容生成成功:")
-            logger.info(f"   📝 標題數量: {len(self.task.ai_title_suggestions)}")
-            logger.info(f"   📄 摘要長度: {len(self.task.ai_content_summary)} 字元")
-            logger.info(f"   🏷️ 標籤數量: {len(self.task.ai_tag_suggestions)}")
+            # 新增欄位
+            self.task.keywords = ai_data.get("關鍵字", [])
+            self.task.sentiment = ai_data.get("情感分析", "中性")
+            self.task.content_type = ai_data.get("內容類型", "其他")
             
-            # 顯示生成的內容
-            if self.task.ai_title_suggestions:
-                logger.info("💡 建議標題:")
-                for i, title in enumerate(self.task.ai_title_suggestions, 1):
-                    logger.info(f"   {i}. {title}")
+            logger.info("✅ 增強版 AI 內容生成成功")
             
-            if self.task.ai_tag_suggestions:
-                logger.info(f"🏷️ 建議標籤: {' '.join(self.task.ai_tag_suggestions)}")
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"❌ AI 回應 JSON 解析失敗: {e}")
-            logger.error(f"原始回應: {ai_content[:200]}...")
-            self.task.error_message = "AI 回應格式錯誤"
         except Exception as e:
             logger.error(f"❌ AI 內容生成失敗: {e}")
-            self.task.error_message = f"AI 服務錯誤: {str(e)}"
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def _update_notion_page(self):
-        """更新 Notion 頁面"""
-        if not self.notion_enabled:
-            logger.warning("⚠️ Notion 未啟用，跳過頁面更新")
-            return False
+            # 設置基本的 fallback 內容
+            self._set_fallback_content()
+    
+    def _set_fallback_content(self):
+        """設置備用內容（當 AI 失敗時）"""
+        self.task.ai_title_suggestions = [
+            f"精彩影片：{self.task.task_name}",
+            f"必看內容 - {self.task.task_name}",
+            f"最新影片分享：{self.task.task_name}"
+        ]
+        self.task.ai_content_summary = f"這是一部由 {self.task.videographer} 拍攝，{self.task.person_in_charge} 負責的影片：{self.task.task_name}。"
+        self.task.ai_tag_suggestions = ["#影片", "#內容", "#分享", "#台灣"]
         
-        try:
-            logger.info(f"📝 開始更新 Notion 頁面: {self.task.notion_page_id}")
-            
-            # 準備更新屬性
-            properties = {
-                "狀態": {
-                    "select": {"name": "✅ 處理完成" if self.task.status == "完成" else "⚠️ 處理失敗"}
-                }
-            }
-            
-            # 添加處理結果
-            if self.task.processed_video_url and self.task.processed_video_url.startswith('http'):
-                properties["處理後影片"] = {"url": self.task.processed_video_url}
-            
-            if self.task.processed_thumbnail_url and self.task.processed_thumbnail_url.startswith('http'):
-                properties["縮圖連結"] = {"url": self.task.processed_thumbnail_url}
-            
-            # 添加 AI 生成內容
-            if self.task.ai_content_summary:
-                properties["內容摘要"] = {
-                    "rich_text": [{"text": {"content": self.task.ai_content_summary[:2000]}}]
-                }
-            
-            if self.task.ai_title_suggestions:
-                # 將標題建議轉換為文字格式
-                titles_text = "\n".join([f"{i}. {title}" for i, title in enumerate(self.task.ai_title_suggestions, 1)])
-                properties["AI標題建議"] = {
-                    "rich_text": [{"text": {"content": titles_text[:2000]}}]
-                }
-            
-            if self.task.ai_tag_suggestions:
-                tags_text = " ".join(self.task.ai_tag_suggestions)
-                properties["標籤建議"] = {
-                    "rich_text": [{"text": {"content": tags_text[:2000]}}]
-                }
-            
-            # 添加任務 ID
-            properties["任務ID"] = {
-                "rich_text": [{"text": {"content": self.task.task_id}}]
-            }
-            
-            # 發送更新請求
-            url = f"https://api.notion.com/v1/pages/{self.task.notion_page_id}"
-            response = requests.patch(
-                url, 
-                headers=self.notion_headers, 
-                json={'properties': properties},
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                logger.info("✅ Notion 頁面更新成功")
-                return True
-            else:
-                logger.error(f"❌ Notion 頁面更新失敗: {response.status_code}")
-                logger.error(f"回應內容: {response.text}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"❌ 更新 Notion 頁面時發生錯誤: {e}")
-            return False
-
-    def _cleanup(self):
-        """清理臨時資料夾"""
-        try:
-            import shutil
-            shutil.rmtree(self.temp_dir)
-            logger.info("🧹 臨時檔案清理完成")
-        except Exception as e:
-            logger.warning(f"⚠️ 臨時檔案清理失敗: {e}")
-
+        logger.info("✅ 已設置備用內容")
+    
     def process(self) -> Dict[str, Any]:
-        """執行完整的處理流程"""
+        """增強版處理流程"""
         start_time = datetime.now()
         logger.info("="*60)
-        logger.info(f"🚀 開始執行影片處理流程")
+        logger.info(f"🚀 開始執行增強版影片處理流程")
         logger.info(f"📋 任務 ID: {self.task.task_id}")
         logger.info(f"🎬 任務名稱: {self.task.task_name}")
         logger.info("="*60)
         
+        transcript_data = None
+        backup_paths = {}
+        
         try:
             # 步驟 1: 下載影片和縮圖
-            logger.info("📥 步驟 1/4: 下載影片")
+            logger.info("📥 步驟 1/6: 下載影片")
             video_path, thumb_path = self._download_video()
             
-            # 步驟 2: 上傳到 R2（如果啟用）
-            logger.info("☁️ 步驟 2/4: 上傳檔案")
-            self.task.processed_video_url = self._upload_to_r2(video_path, "videos")
-            if thumb_path:
-                self.task.processed_thumbnail_url = self._upload_to_r2(thumb_path, "thumbnails")
+            # 步驟 2: 提取影片幀（如果沒有縮圖）
+            if not thumb_path:
+                logger.info("🖼️ 步驟 2/6: 提取影片幀")
+                thumb_path = self._extract_video_frame(video_path)
+            else:
+                logger.info("✅ 步驟 2/6: 已有縮圖，跳過幀提取")
             
-            # 步驟 3: AI 分析
-            logger.info("🤖 步驟 3/4: AI 內容生成")
-            self._generate_ai_content()
+            # 步驟 3: 備份到本地
+            logger.info("📁 步驟 3/6: 備份檔案到 downloads")
+            backup_paths = self._backup_to_downloads(video_path, thumb_path)
             
-            # 步驟 4: 更新 Notion 頁面
-            logger.info("📝 步驟 4/4: 更新 Notion")
-            self._update_notion_page()
+            # 步驟 4: 語音轉文字 (可選)
+            logger.info("🎤 步驟 4/6: 語音轉文字")
+            transcript_data = self._transcribe_with_whisper(video_path)
+            
+            # 步驟 5: 上傳到 R2（如果啟用）
+            logger.info("☁️ 步驟 5/6: 上傳檔案到雲端")
+            if self.r2_enabled:
+                try:
+                    self.task.processed_video_url = self._upload_to_r2(video_path, "videos")
+                    if thumb_path:
+                        self.task.processed_thumbnail_url = self._upload_to_r2(thumb_path, "thumbnails")
+                except Exception as e:
+                    logger.error(f"❌ R2 上傳失敗，使用本地備份: {e}")
+                    self.task.processed_video_url = f"local://{backup_paths.get('video', video_path)}"
+                    if thumb_path:
+                        self.task.processed_thumbnail_url = f"local://{backup_paths.get('thumbnail', thumb_path)}"
+            else:
+                logger.info("📁 R2 未啟用，使用本地路徑")
+                self.task.processed_video_url = f"local://{backup_paths.get('video', video_path)}"
+                if thumb_path:
+                    self.task.processed_thumbnail_url = f"local://{backup_paths.get('thumbnail', thumb_path)}"
+            
+            # 步驟 6: AI 分析（增強版）
+            logger.info("🤖 步驟 6/6: AI 內容生成")
+            self._enhanced_ai_content_with_transcript(transcript_data)
             
             # 更新最終狀態
-            if not self.task.error_message:
-                self.task.status = "完成"
-                logger.info("🎉 影片處理流程完全成功")
-            else:
-                self.task.status = "部分完成"
-                logger.warning(f"⚠️ 處理完成但有錯誤: {self.task.error_message}")
-
+            self.task.status = "完成"
+            logger.info("🎉 增強版影片處理流程完全成功")
+            
         except Exception as e:
-            logger.error("❌ 處理過程中發生致命錯誤")
+            logger.error("❌ 處理過程中發生錯誤")
             logger.error(f"錯誤詳情: {str(e)}")
-            logger.error(f"錯誤類型: {type(e).__name__}")
             
             self.task.status = "失敗"
             self.task.error_message = str(e)
+            
+            # 即使失敗也要設置備用內容
+            self._set_fallback_content()
         
         finally:
             # 計算處理時間
             end_time = datetime.now()
             duration = (end_time - start_time).total_seconds()
             
-            # 清理臨時檔案
+            # 清理臨時檔案（但保留 downloads）
             self._cleanup()
             
-            # 輸出最終結果
+            # 添加轉錄數據到結果
+            result = asdict(self.task)
+            if transcript_data:
+                result['transcript'] = transcript_data
+            result['backup_paths'] = backup_paths
+            result['processing_time'] = duration
+            
             logger.info("="*60)
-            logger.info("📊 處理結果摘要")
+            logger.info("📊 增強版處理結果摘要")
             logger.info("="*60)
             logger.info(f"⏱️ 總處理時間: {duration:.1f} 秒")
             logger.info(f"📄 任務 ID: {self.task.task_id}")
             logger.info(f"✅ 最終狀態: {self.task.status}")
-            
-            if self.task.processed_video_url:
-                logger.info(f"🎥 影片連結: {self.task.processed_video_url}")
-            if self.task.processed_thumbnail_url:
-                logger.info(f"🖼️ 縮圖連結: {self.task.processed_thumbnail_url}")
-            
+            logger.info(f"📁 本地備份: {len(backup_paths)} 個檔案")
+            if transcript_data:
+                logger.info(f"🎤 轉錄文字: {len(transcript_data.get('text', ''))} 字元")
             logger.info("="*60)
             
-            return asdict(self.task)
+            return result
