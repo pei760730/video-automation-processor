@@ -1,113 +1,186 @@
-# .github/workflows/process-video.yml - v3.0 (最終穩定版)
-
+# .github/workflows/process-video.yml - v4.1 (優化修正版)
 name: Process Video from Notion Trigger
 
 on:
   repository_dispatch:
     types: [process_notion_task]
+  
   workflow_dispatch:
     inputs:
       notion_page_id:
         description: '要處理的 Notion Page ID'
         required: true
+        type: string
       original_link:
         description: '影片 URL'
         required: true
-      task_name:
-# .github/workflows/process-video.yml - v4.0 (最終簡化版)
-
-name: Process Video from Notion Trigger
-
-on:
-  repository_dispatch:
-    types: [process_notion_task]
-  workflow_dispatch:
-    inputs:
-      notion_page_id:
-        description: '要處理的 Notion Page ID'
-        required: true
-      original_link:
-        description: '影片 URL'
-        required: true
+        type: string
       task_name:
         description: '任務名稱'
         required: true
+        type: string
       person_in_charge:
         description: '負責人'
+        required: false
+        type: string
       videographer:
         description: '攝影師'
+        required: false
+        type: string
+
+# 設定並行控制
+concurrency:
+  group: notion-video-${{ github.event.client_payload.notion_page_id || github.event.inputs.notion_page_id }}
+  cancel-in-progress: false
 
 jobs:
   process-video:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30  # 整體工作超時限制
+    
     steps:
-    # 步驟 1: 拉取程式碼
-    # 預設行為是將 repo 內容直接 checkout 到工作區根目錄
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    # 步驟 2: 設定 Python 環境
-    - name: Set up Python 3.11
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
-        
-    # 步驟 3: 安裝系統依賴
-    - name: Install system dependencies (ffmpeg & yt-dlp)
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y ffmpeg
-        sudo wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
-        sudo chmod a+rx /usr/local/bin/yt-dlp
-        
-    # 步驟 4: 快取 Python 依賴
-    - name: Cache pip dependencies
-      uses: actions/cache@v4
-      with:
-        # ✅ 關鍵：現在 requirements.txt 就在根目錄
-        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-        path: ~/.cache/pip
-        restore-keys: |
-          ${{ runner.os }}-pip-
-
-    # 步驟 5: 安裝 Python 函式庫
-    - name: Install dependencies
-      # ✅ 關鍵：移除 working-directory，因為檔案就在當前目錄
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        
-    # 步驟 6: 執行核心 Python 腳本
-    - name: Run Python Processor
-      id: run-processor
-      timeout-minutes: 15
-      # ✅ 關鍵：移除 working-directory
-      # ✅ 關鍵：加回 PYTHONPATH: . 來解決模組匯入問題
-      env:
-        PYTHONPATH: .
-        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-        R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY_ID }}
-        R2_SECRET_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
-        R2_CUSTOM_DOMAIN: ${{ secrets.R2_PUBLIC_URL }}
-        NOTION_PAGE_ID: ${{ github.event.client_payload.notion_page_id || github.event.inputs.notion_page_id }}
-        ORIGINAL_LINK: ${{ github.event.client_payload.original_link || github.event.inputs.original_link }}
-        TASK_NAME: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}
-        PERSON_IN_CHARGE: ${{ github.event.client_payload.person_in_charge || github.event.inputs.person_in_charge }}
-        VIDEOGRAPHER: ${{ github.event.client_payload.videographer || github.event.inputs.videographer }}
-      run: |
-        echo "🏃‍♂️ Starting main.py..."
-        python main.py
-        echo "🏁 main.py finished."
-
-    # 步驟 7: 上傳日誌（僅在失敗時）
-    - name: Upload logs on failure
-      if: failure()
-      uses: actions/upload-artifact@v4
-      with:
-        name: failure-logs-${{ github.run_id }}
-        # ✅ 關鍵：日誌檔案也在根目錄
-        path: "*.log"
-        retention-days: 7
+      # 步驟 1: 拉取程式碼
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1  # 淺克隆，只取最新版本
+      
+      # 步驟 2: 設定 Python 環境
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'  # 內建的 pip 快取功能
+      
+      # 步驟 3: 安裝系統依賴
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          
+          # 安裝 yt-dlp 到 /usr/local/bin
+          sudo wget -q https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
+          sudo chmod a+rx /usr/local/bin/yt-dlp
+          
+          # 驗證安裝
+          ffmpeg -version | head -n1
+          yt-dlp --version
+      
+      # 步驟 4: 安裝 Python 函式庫
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          
+          # 顯示已安裝套件版本（用於除錯）
+          pip list
+      
+      # 步驟 5: 驗證環境變數
+      - name: Validate environment
+        run: |
+          echo "🔍 Checking environment variables..."
+          
+          # 檢查必要的 secrets 是否設定
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "❌ Error: OPENAI_API_KEY is not set"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.R2_ACCOUNT_ID }}" ]; then
+            echo "❌ Error: R2_ACCOUNT_ID is not set"
+            exit 1
+          fi
+          
+          echo "✅ All required secrets are configured"
+          
+          # 顯示任務資訊（不顯示敏感資料）
+          echo "📋 Task Info:"
+          echo "  - Notion Page ID: ${{ github.event.client_payload.notion_page_id || github.event.inputs.notion_page_id }}"
+          echo "  - Task Name: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}"
+          echo "  - Person in Charge: ${{ github.event.client_payload.person_in_charge || github.event.inputs.person_in_charge || 'Not specified' }}"
+          echo "  - Videographer: ${{ github.event.client_payload.videographer || github.event.inputs.videographer || 'Not specified' }}"
+      
+      # 步驟 6: 執行核心 Python 腳本
+      - name: Run Video Processor
+        id: run-processor
+        timeout-minutes: 20  # 個別步驟超時限制
+        env:
+          # Python 環境設定
+          PYTHONPATH: .
+          PYTHONUNBUFFERED: 1  # 即時輸出，不緩衝
+          
+          # API Keys
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          
+          # R2 儲存設定
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
+          R2_CUSTOM_DOMAIN: ${{ secrets.R2_PUBLIC_URL }}
+          
+          # 任務參數（優先使用 repository_dispatch 的資料）
+          NOTION_PAGE_ID: ${{ github.event.client_payload.notion_page_id || github.event.inputs.notion_page_id }}
+          ORIGINAL_LINK: ${{ github.event.client_payload.original_link || github.event.inputs.original_link }}
+          TASK_NAME: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}
+          PERSON_IN_CHARGE: ${{ github.event.client_payload.person_in_charge || github.event.inputs.person_in_charge || '' }}
+          VIDEOGRAPHER: ${{ github.event.client_payload.videographer || github.event.inputs.videographer || '' }}
+        run: |
+          echo "🏃‍♂️ Starting video processing..."
+          echo "⏰ Start time: $(date)"
+          
+          # 執行主程式
+          python main.py
+          
+          # 記錄執行結果
+          EXIT_CODE=$?
+          echo "⏰ End time: $(date)"
+          
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "✅ Video processing completed successfully!"
+          else
+            echo "❌ Video processing failed with exit code: $EXIT_CODE"
+            exit $EXIT_CODE
+          fi
+      
+      # 步驟 7: 清理暫存檔案
+      - name: Clean up temporary files
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "🧹 Cleaning up temporary files..."
+          
+          # 清理可能的暫存檔案
+          find . -name "*.tmp" -type f -delete 2>/dev/null || true
+          find . -name "*.part" -type f -delete 2>/dev/null || true
+          
+          # 清理下載的影片檔案（如果存在）
+          find . -name "*.mp4" -type f -size +100M -delete 2>/dev/null || true
+          find . -name "*.webm" -type f -size +100M -delete 2>/dev/null || true
+          
+          echo "✅ Cleanup completed"
+      
+      # 步驟 8: 上傳日誌（失敗時）
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            *.log
+            *.txt
+            !requirements.txt
+          retention-days: 7
+          if-no-files-found: warn
+      
+      # 步驟 9: 發送通知（可選）
+      - name: Send notification on failure
+        if: failure() && github.event_name == 'repository_dispatch'
+        continue-on-error: true
+        run: |
+          echo "📧 Sending failure notification..."
+          # 這裡可以加入發送通知的邏輯，例如：
+          # - 更新 Notion 頁面狀態
+          # - 發送 Slack 通知
+          # - 發送 Email
+          echo "⚠️ Video processing failed for task: ${{ github.event.client_payload.task_name || github.event.inputs.task_name }}"
