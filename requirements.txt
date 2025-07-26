@@ -1,65 +1,47 @@
-# 短影音自動化處理系統相依套件
-# 優化版本 v2.1
-# 基於NOTION標題結構優化
+# 影片處理和下載
+yt-dlp>=2023.12.30
 
-# ==== 核心影片處理 ====
-yt-dlp>=2024.7.16
-ffmpeg-python>=0.2.0
+# 雲端儲存 (AWS S3 相容的 Cloudflare R2)
+boto3>=1.34.0
+botocore>=1.34.0
 
-# ==== AI 內容生成 ====
-openai>=1.35.0
+# AI 服務
+openai>=1.10.0
 
-# ==== 雲端儲存 ====
-boto3>=1.34.144
-botocore>=1.34.144
+# 結構化日誌
+structlog>=23.2.0
 
-# ==== HTTP 請求與網路 ====
-requests>=2.31.0
-urllib3>=2.0.0
+# 重試機制
+tenacity>=8.2.3
 
-# ==== 資料處理與時間 ====
+# 資料處理
 python-dateutil>=2.8.2
+
+# 系統工具
+pathlib2>=2.3.7; python_version < "3.4"
+
+# HTTP 請求 (yt-dlp 依賴)
+requests>=2.31.0
+urllib3>=1.26.18
+
+# 加密和編碼 (boto3 依賴)
+cryptography>=41.0.0
+
+# JSON 處理增強
+simplejson>=3.19.0
+
+# 檔案操作
+pathspec>=0.11.0
+
+# 網路工具
+certifi>=2023.11.17
+
+# 日期時間處理
 pytz>=2023.3
 
-# ==== 安全性 ====
-cryptography>=41.0.0
-certifi>=2023.7.22
+# 型別檢查工具 (開發用，可選)
+# typing-extensions>=4.8.0
 
-# ==== 日誌和監控 ====
-structlog>=23.1.0
-
-# ==== 錯誤處理和重試 ====
-tenacity>=8.2.3
-backoff>=2.2.1
-
-# ==== 資料結構與類型提示 ====
-typing-extensions>=4.7.0
-
-# ==== 系統工具 (Python < 3.6 相容性) ====
-pathlib2>=2.3.7; python_version < '3.4'
-tempfile36>=1.1.0; python_version < '3.6'
-
-# ==== JSON 和配置處理 ====
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
-
-# ==== 額外的網路和安全性 ====
-idna>=3.4
-charset-normalizer>=3.2.0
-
-# ==== 開發和除錯工具 (可選) ====
-# 在生產環境中可以移除這些
-rich>=13.0.0  # 美化日誌輸出
-click>=8.1.0  # 命令列工具
-
-# ==== 效能優化 ====
-psutil>=5.9.0  # 系統資源監控
-
-# ==== 檔案處理 ====
-Pillow>=10.0.0  # 圖片處理 (縮圖優化)
-python-magic>=0.4.27  # 檔案類型檢測
-
-# ==== 版本鎖定說明 ====
-# 使用 >= 而非 == 以允許次要版本更新
-# 主要版本已鎖定以確保相容性
-# 定期檢查並更新依賴版本
+# 測試工具 (開發用，可選)  
+# pytest>=7.4.0
+# pytest-asyncio>=0.21.0
