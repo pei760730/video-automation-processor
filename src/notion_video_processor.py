@@ -6,6 +6,7 @@ import json
 import tempfile
 import hashlib
 import logging
+import requests
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -59,7 +60,7 @@ class NotionTask:
 # --- 核心處理器 ---
 class NotionVideoProcessor:
     """
-    為 Notion Video Pipeline 設計的影片處理器 - 生產版本
+    為 Notion Video Pipeline 設計的影片處理器 - 完整優化版
     """
     def __init__(self):
         """初始化，讀取環境變數並設定客戶端"""
@@ -89,8 +90,8 @@ class NotionVideoProcessor:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def _setup_clients(self):
-        """設定 OpenAI 和 R2 客戶端"""
-        # 檢查 OpenAI API Key
+        """設定 OpenAI、R2 和 Notion 客戶端"""
+        # 1. 設定 OpenAI 客戶端
         openai_key = os.getenv('OPENAI_API_KEY')
         if not openai_key:
             raise ValueError("❌ 缺少 OPENAI_API_KEY 環境變數")
@@ -101,7 +102,7 @@ class NotionVideoProcessor:
         except Exception as e:
             raise ValueError(f"❌ OpenAI 客戶端初始化失敗: {e}")
         
-        # 檢查 R2 配置
+        # 2. 設定 R2 客戶端
         r2_config = {
             'account_id': os.getenv('R2_ACCOUNT_ID'),
             'access_key': os.getenv('R2_ACCESS_KEY'),
@@ -130,6 +131,25 @@ class NotionVideoProcessor:
                 logger.error(f"❌ R2 客戶端初始化失敗: {e}")
                 self.r2_client = None
                 self.r2_enabled = False
+        
+        # 3. 設定 Notion 客戶端
+        notion_config = {
+            'api_key': os.getenv('NOTION_API_KEY'),
+            'database_id': os.getenv('NOTION_DATABASE_ID')
+        }
+        
+        if not notion_config['api_key'] or not notion_config['database_id']:
+            logger.warning("⚠️ Notion 配置不完整，將跳過 Notion 更新")
+            self.notion_enabled = False
+        else:
+            self.notion_enabled = True
+            self.notion_headers = {
+                'Authorization': f'Bearer {notion_config["api_key"]}',
+                'Content-Type': 'application/json',
+                'Notion-Version': '2022-06-28'
+            }
+            self.notion_database_id = notion_config['database_id']
+            logger.info("✅ Notion 客戶端初始化成功")
 
     def _download_video(self) -> Tuple[str, Optional[str]]:
         """下載影片和縮圖，返回檔案路徑"""
@@ -289,6 +309,75 @@ class NotionVideoProcessor:
             logger.error(f"❌ AI 內容生成失敗: {e}")
             self.task.error_message = f"AI 服務錯誤: {str(e)}"
 
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    def _update_notion_page(self):
+        """更新 Notion 頁面"""
+        if not self.notion_enabled:
+            logger.warning("⚠️ Notion 未啟用，跳過頁面更新")
+            return False
+        
+        try:
+            logger.info(f"📝 開始更新 Notion 頁面: {self.task.notion_page_id}")
+            
+            # 準備更新屬性
+            properties = {
+                "狀態": {
+                    "select": {"name": "✅ 處理完成" if self.task.status == "完成" else "⚠️ 處理失敗"}
+                }
+            }
+            
+            # 添加處理結果
+            if self.task.processed_video_url and self.task.processed_video_url.startswith('http'):
+                properties["處理後影片"] = {"url": self.task.processed_video_url}
+            
+            if self.task.processed_thumbnail_url and self.task.processed_thumbnail_url.startswith('http'):
+                properties["縮圖連結"] = {"url": self.task.processed_thumbnail_url}
+            
+            # 添加 AI 生成內容
+            if self.task.ai_content_summary:
+                properties["內容摘要"] = {
+                    "rich_text": [{"text": {"content": self.task.ai_content_summary[:2000]}}]
+                }
+            
+            if self.task.ai_title_suggestions:
+                # 將標題建議轉換為文字格式
+                titles_text = "\n".join([f"{i}. {title}" for i, title in enumerate(self.task.ai_title_suggestions, 1)])
+                properties["AI標題建議"] = {
+                    "rich_text": [{"text": {"content": titles_text[:2000]}}]
+                }
+            
+            if self.task.ai_tag_suggestions:
+                tags_text = " ".join(self.task.ai_tag_suggestions)
+                properties["標籤建議"] = {
+                    "rich_text": [{"text": {"content": tags_text[:2000]}}]
+                }
+            
+            # 添加任務 ID
+            properties["任務ID"] = {
+                "rich_text": [{"text": {"content": self.task.task_id}}]
+            }
+            
+            # 發送更新請求
+            url = f"https://api.notion.com/v1/pages/{self.task.notion_page_id}"
+            response = requests.patch(
+                url, 
+                headers=self.notion_headers, 
+                json={'properties': properties},
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                logger.info("✅ Notion 頁面更新成功")
+                return True
+            else:
+                logger.error(f"❌ Notion 頁面更新失敗: {response.status_code}")
+                logger.error(f"回應內容: {response.text}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ 更新 Notion 頁面時發生錯誤: {e}")
+            return False
+
     def _cleanup(self):
         """清理臨時資料夾"""
         try:
@@ -309,18 +398,22 @@ class NotionVideoProcessor:
         
         try:
             # 步驟 1: 下載影片和縮圖
-            logger.info("📥 步驟 1/3: 下載影片")
+            logger.info("📥 步驟 1/4: 下載影片")
             video_path, thumb_path = self._download_video()
             
             # 步驟 2: 上傳到 R2（如果啟用）
-            logger.info("☁️ 步驟 2/3: 上傳檔案")
+            logger.info("☁️ 步驟 2/4: 上傳檔案")
             self.task.processed_video_url = self._upload_to_r2(video_path, "videos")
             if thumb_path:
                 self.task.processed_thumbnail_url = self._upload_to_r2(thumb_path, "thumbnails")
             
             # 步驟 3: AI 分析
-            logger.info("🤖 步驟 3/3: AI 內容生成")
+            logger.info("🤖 步驟 3/4: AI 內容生成")
             self._generate_ai_content()
+            
+            # 步驟 4: 更新 Notion 頁面
+            logger.info("📝 步驟 4/4: 更新 Notion")
+            self._update_notion_page()
             
             # 更新最終狀態
             if not self.task.error_message:
