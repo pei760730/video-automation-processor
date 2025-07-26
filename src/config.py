@@ -31,8 +31,8 @@ class NotionConfig:
         
         if not self.api_key:
             errors.append("缺少 NOTION_API_KEY 環境變數")
-        elif not self.api_key.startswith("secret_"):
-            errors.append("NOTION_API_KEY 格式不正確，應以 'secret_' 開頭")
+        elif not self.api_key.startswith("ntn_"):
+            errors.append("NOTION_API_KEY 格式不正確，應以 'ntn_' 開頭")
         
         if not self.database_id:
             errors.append("缺少 NOTION_DATABASE_ID 環境變數")
@@ -250,4 +250,3 @@ def check_required_env_vars() -> Dict[str, bool]:
         "optional": optional_vars,
         "all_required_set": all(required_vars.values())
     }
-]
